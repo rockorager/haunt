@@ -1,0 +1,23 @@
+.{
+    .name = "haunt",
+    .version = "0.0.0",
+    .dependencies = .{
+        .ghostty = .{
+            .url = "git+https://github.com/gabydd/ghostty?ref=module#89a78c05122ca01ed5ec36663a80a3de50744c70",
+            .hash = "1220aa8f7dea4b91bc710c9ea8b080af04b955a56f4b6b6f73abbac141cbcef9d38e",
+        },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#263412c98a89bd9bbe24f99c395fa8d7975229e2",
+            .hash = "122076d3d5095f75bc649701eaf6babe238288becbed4a2fbe040982c5cdf1a0ec03",
+        },
+        .iterm2_themes = .{
+            .url = "https://github.com/mbadolato/iTerm2-Color-Schemes/archive/25cb3c3f52c7011cd8a599f8d144fc63f4409eb6.tar.gz",
+            .hash = "1220dc1096bda9721c1f5256177539bf37b41ac6fb70d58eadf0eec45359676382e5",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
