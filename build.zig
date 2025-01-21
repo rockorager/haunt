@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "haunt",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/main2.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -58,9 +58,16 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .@"app-runtime" = .none,
         });
-        const ghostty_mod = ghostty.module("ghostty");
 
+        const ghostty_mod = ghostty.module("ghostty");
         exe.root_module.addImport("ghostty", ghostty_mod);
+
+        const libxev = ghostty.builder.dependency("libxev", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        const libxev_mod = libxev.module("xev");
+        exe.root_module.addImport("xev", libxev_mod);
     }
 
     {
@@ -73,4 +80,16 @@ pub fn build(b: *std.Build) !void {
 
         exe.root_module.addImport("vaxis", vaxis_mod);
     }
+
+    // {
+    //
+    //     // libxev mod
+    //     const libxev = b.dependency("libxev", .{
+    //         .target = target,
+    //         .optimize = optimize,
+    //     });
+    //     const libxev_mod = libxev.module("xev");
+    //
+    //     exe.root_module.addImport("xev", libxev_mod);
+    // }
 }
