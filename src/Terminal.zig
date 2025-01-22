@@ -239,12 +239,12 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             ctx.redraw = true;
             try ctx.tick(8, self.widget());
         },
-        .key_press => |key| {
+        .key_press, .key_release => |key| {
             if (key.matches('c', .{ .ctrl = true })) {
                 ctx.quit = true;
                 return;
             }
-            const key_event = vaxisKeyToGhosttyKey(key, true);
+            const key_event = vaxisKeyToGhosttyKey(key, event == .key_press);
             try self.handleKeyEvent(ctx, key_event);
         },
         else => {},
@@ -257,20 +257,44 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
 }
 
 pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+    const max = ctx.max.size();
+
     var surface = try vxfw.Surface.init(
         ctx.arena,
         self.widget(),
-        .{ .height = self.size.rows, .width = self.size.cols },
+        max,
     );
 
     self.renderer_mutex.lock();
     defer self.renderer_mutex.unlock();
 
+    if (max.width != self.size.cols or max.height != self.size.rows) {
+        // trigger resize
+        self.size = .{
+            .rows = max.height,
+            .cols = max.width,
+            .x_pixel = max.width * 8,
+            .y_pixel = max.width * 16,
+        };
+        const size: renderer.Size = .{
+            .screen = .{ .height = self.size.y_pixel, .width = self.size.x_pixel },
+            .cell = .{
+                .height = self.size.y_pixel / self.size.rows,
+                .width = self.size.x_pixel / self.size.cols,
+            },
+            .padding = .{},
+        };
+        self.io.queueMessage(.{ .resize = size }, .locked);
+        self.screen.deinit(self.gpa);
+        self.screen = try vaxis.AllocatingScreen.init(self.gpa, self.size.cols, self.size.rows);
+        return surface;
+    }
+
     var row: u16 = 0;
     while (row < self.size.rows) : (row += 1) {
         var col: u16 = 0;
         while (col < self.size.cols) : (col += 1) {
-            const cell = self.screen.readCell(col, row) orelse unreachable;
+            const cell = self.screen.readCell(col, row) orelse continue;
             surface.writeCell(col, row, cell);
         }
     }
@@ -290,14 +314,23 @@ fn vaxisKeyToGhosttyKey(key: vaxis.Key, press: bool) input.KeyEvent {
         .shift = key.mods.shift,
         .super = key.mods.super,
     };
+    const consumed_mods = blk: {
+        var consumed_mods: input.Mods = .{};
+        // If we have a shifted codepoint, we have consumed shift
+        if (key.shifted_codepoint != null) {
+            consumed_mods.shift = true;
+        }
+        break :blk consumed_mods;
+    };
     return .{
         .action = action,
         .key = physical_key,
         .physical_key = physical_key,
         .mods = mods,
-        .consumed_mods = .{},
+        .consumed_mods = consumed_mods,
         .composing = false,
         .utf8 = if (key.text) |text| text else "",
+        .unshifted_codepoint = key.codepoint,
         // TODO: .unshifted_codepoint,
     };
 }
@@ -305,6 +338,7 @@ fn vaxisKeyToGhosttyKey(key: vaxis.Key, press: bool) input.KeyEvent {
 fn codepointToGhosttyKey(cp: u21) input.Key {
     return switch (cp) {
         ' ' => .space,
+        ';' => .semicolon,
 
         'a' => .a,
         'b' => .b,
@@ -346,6 +380,14 @@ fn codepointToGhosttyKey(cp: u21) input.Key {
 
         vaxis.Key.enter => .enter,
         vaxis.Key.backspace => .backspace,
+
+        vaxis.Key.up => .up,
+        vaxis.Key.down => .down,
+        vaxis.Key.right => .right,
+        vaxis.Key.left => .left,
+
+        vaxis.Key.left_shift => .left_shift,
+        vaxis.Key.right_shift => .right_shift,
         else => .invalid,
     };
 }
@@ -377,19 +419,62 @@ fn queueRender(
 }
 
 fn updateScreen(self: *Terminal) !void {
-    self.renderer_mutex.lock();
-    defer self.renderer_mutex.unlock();
+    var screen: terminal.Screen = critical: {
+        // Take the lock in the critical path
+        self.renderer_mutex.lock();
+        defer self.renderer_mutex.unlock();
 
-    const state = self.renderer_state;
-    const screen = state.terminal.screen;
+        const state = &self.renderer_state;
+
+        // If we're in a synchronized output state, we pause all rendering.
+        if (state.terminal.modes.get(.synchronized_output)) {
+            log.debug("synchronized output started, skipping render", .{});
+            return;
+        }
+
+        if (self.size.cols != state.terminal.cols or self.size.rows != state.terminal.rows) {
+            // Skip a frame if our size doesn't match
+            log.debug("size mismatch, skipping render frame", .{});
+            return;
+        }
+
+        var screen = try state.terminal.screen.clone(self.gpa, .{ .viewport = .{} }, null);
+        errdefer screen.deinit();
+
+        // TODO: kitty images. See ghostty repo: src/renderer/OpenGL.zig:803
+
+        // Set our cursor visible state while we have the lock
+        if (state.terminal.modes.get(.cursor_visible)) {
+            const blink = state.terminal.modes.get(.cursor_blinking);
+            const shape: vaxis.Cell.CursorShape = switch (state.terminal.screen.cursor.cursor_style) {
+                .bar => if (blink) .beam_blink else .beam,
+                .block, .block_hollow => if (blink) .block_blink else .block,
+                .underline => if (blink) .underline_blink else .underline,
+            };
+            self.cursor_state = .{
+                .col = state.terminal.screen.cursor.x,
+                .row = state.terminal.screen.cursor.y,
+                .shape = shape,
+            };
+        } else {
+            self.cursor_state = null;
+        }
+
+        break :critical screen;
+    };
+
+    defer screen.deinit();
+
     var row_iter = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row: u16 = 0;
     while (row_iter.next()) |pin| {
         defer row += 1;
+        if (row >= self.screen.height) break;
         var col: u16 = 0;
         const cells = pin.cells(.all);
         for (cells) |cell| {
             defer col += 1;
+            if (col >= self.screen.width) break;
             const vx_style: vaxis.Style = if (cell.hasStyling())
                 ghosttyStyleToVaxisStyle(pin.style(&cell))
             else
@@ -419,22 +504,6 @@ fn updateScreen(self: *Terminal) !void {
             }
         }
     }
-
-    if (state.terminal.modes.get(.cursor_visible)) {
-        const blink = state.terminal.modes.get(.cursor_blinking);
-        const shape: vaxis.Cell.CursorShape = switch (state.terminal.screen.cursor.cursor_style) {
-            .bar => if (blink) .beam_blink else .beam,
-            .block, .block_hollow => if (blink) .block_blink else .block,
-            .underline => if (blink) .underline_blink else .underline,
-        };
-        self.cursor_state = .{
-            .col = state.terminal.screen.cursor.x,
-            .row = state.terminal.screen.cursor.y,
-            .shape = shape,
-        };
-    } else {
-        self.cursor_state = null;
-    }
 }
 
 fn handleKeyEvent(self: *Terminal, ctx: *vxfw.EventContext, event: input.KeyEvent) anyerror!void {
@@ -444,7 +513,10 @@ fn handleKeyEvent(self: *Terminal, ctx: *vxfw.EventContext, event: input.KeyEven
 
     if (self.io.terminal.modes.get(.disable_keyboard)) return;
 
-    const write_req = try self.encodeKey(event) orelse return;
+    const write_req = try self.encodeKey(event) orelse {
+        log.warn("key couldn't be encoded: {}", .{event});
+        return;
+    };
     errdefer write_req.deinit();
     self.io.queueMessage(switch (write_req) {
         .small => |v| .{ .write_small = v },
@@ -470,6 +542,7 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
     // whatsoever.
     const enc: input.KeyEncoder = enc: {
         const t = &self.io.terminal;
+
         break :enc .{
             .event = event,
             .macos_option_as_alt = .false,
@@ -482,6 +555,7 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
         };
     };
 
+    log.warn("kitty flags: {}", .{enc.kitty_flags});
     const write_req: termio.Message.WriteReq = req: {
         // Try to write the input into a small array. This fits almost
         // every scenario. Larger situations can happen due to long
