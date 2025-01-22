@@ -16,11 +16,13 @@ const Termio = termio.Termio;
 
 const Terminal = @This();
 
+const log = std.log.scoped(.terminal_widget);
+
 pub const App = struct {
     vt: *Terminal,
 
     pub fn wakeup(self: *App) void {
-        std.log.debug("wakeup", .{});
+        log.debug("app wakeup", .{});
         _ = self;
     }
 };
@@ -186,7 +188,7 @@ pub fn deinit(self: *Terminal) void {
     // Stop our IO thread
     {
         self.io_thread.stop.notify() catch |err|
-            std.log.err("error notifying io thread to stop, may stall err={}", .{err});
+            log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
     self.io_thread.deinit();
@@ -231,7 +233,7 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             defer iter.deinit();
             while (iter.next()) |msg| {
                 // TODO: renderermailbox?
-                std.log.debug("{}", .{msg});
+                log.debug("renderer: {s}", .{@tagName(msg)});
             }
             ctx.redraw = true;
             try ctx.tick(8, self.widget());
@@ -276,6 +278,7 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
 }
 
 fn vaxisKeyToGhosttyKey(key: vaxis.Key, press: bool) input.KeyEvent {
+    log.debug("vaxis key = {}", .{key});
     const action: input.Action = if (press) .press else .release;
     const physical_key = codepointToGhosttyKey(key.codepoint);
     const mods: input.Mods = .{
@@ -353,7 +356,7 @@ fn queueRender(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch |err| {
-        std.log.err("error in wakeup err={}", .{err});
+        log.err("error in wakeup err={}", .{err});
         return .rearm;
     };
 
@@ -365,7 +368,7 @@ fn queueRender(
     self.redraw.store(true, .unordered);
 
     self.updateScreen() catch |err| {
-        std.log.err("couldn't update screen={}", .{err});
+        log.err("couldn't update screen={}", .{err});
         return .rearm;
     };
 
@@ -520,7 +523,7 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
 
 fn renderThread(self: *Terminal) void {
     self.loop.run(.until_done) catch |err| {
-        std.log.err("err = {}", .{err});
+        log.err("err = {}", .{err});
     };
 }
 
