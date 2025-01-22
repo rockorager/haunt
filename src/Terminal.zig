@@ -252,10 +252,6 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             try ctx.tick(8, self.widget());
         },
         .key_press, .key_release => |key| {
-            if (key.matches('c', .{ .ctrl = true })) {
-                ctx.quit = true;
-                return;
-            }
             const key_event = vaxisKeyToGhosttyKey(key, event == .key_press);
             try self.handleKeyEvent(ctx, key_event);
         },
@@ -279,6 +275,7 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
         self.widget(),
         max,
     );
+    surface.focusable = true;
 
     self.screen_mutex.lock();
     self.screen_mutex.unlock();
@@ -307,7 +304,8 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
             .padding = .{},
         };
         self.io.queueMessage(.{ .resize = size }, .unlocked);
-        return surface;
+        // HACK: we should return the empty surface but we have some resize issues
+        // return surface;
     }
 
     var row: u16 = 0;
@@ -870,4 +868,5 @@ fn resize(self: *Terminal, size: renderer.Size) !void {
     self.screen.deinit(self.gpa);
     const grid = size.grid();
     self.screen = try vaxis.AllocatingScreen.init(self.gpa, grid.columns, grid.rows);
+    self.redraw.store(true, .unordered);
 }
