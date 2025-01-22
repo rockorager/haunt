@@ -259,6 +259,9 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             const key_event = vaxisKeyToGhosttyKey(key, event == .key_press);
             try self.handleKeyEvent(ctx, key_event);
         },
+        .mouse => |_| {
+            // TODO: mouse reports
+        },
         else => {},
     }
 }
@@ -347,7 +350,6 @@ fn vaxisKeyToGhosttyKey(key: vaxis.Key, press: bool) input.KeyEvent {
         .composing = false,
         .utf8 = if (key.text) |text| text else "",
         .unshifted_codepoint = key.codepoint,
-        // TODO: .unshifted_codepoint,
     };
 }
 
