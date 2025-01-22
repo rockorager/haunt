@@ -23,7 +23,18 @@ pub const App = struct {
 
     pub fn wakeup(self: *App) void {
         log.debug("app wakeup", .{});
-        _ = self;
+        var iter = self.vt.renderer_mailbox.drain();
+        defer iter.deinit();
+        while (iter.next()) |message| {
+            switch (message) {
+                .resize => |size| {
+                    self.vt.resize(size) catch |err| {
+                        log.err("couldn't resize {}", .{err});
+                    };
+                },
+                else => {},
+            }
+        }
     }
 };
 pub const Surface = struct {};
@@ -49,6 +60,7 @@ config: Config = .{},
 
 // The current rendered state
 screen: vaxis.AllocatingScreen,
+screen_mutex: std.Thread.Mutex,
 
 // We need an App declaration in order to work within Ghostty
 app: App,
@@ -59,7 +71,7 @@ mailbox: *ghostty.App.Mailbox.Queue,
 // anything
 core_surface: ghostty.Surface,
 
-size: vaxis.Winsize,
+size: renderer.Size,
 
 loop: xev.Loop,
 wakeup: xev.Async,
@@ -73,11 +85,19 @@ cursor_state: ?vxfw.CursorState = null,
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.gpa = gpa;
-    self.size = opts.size;
+    self.size = .{
+        .screen = .{ .height = opts.size.y_pixel, .width = opts.size.x_pixel },
+        .cell = .{
+            .height = opts.size.y_pixel / opts.size.rows,
+            .width = opts.size.x_pixel / opts.size.cols,
+        },
+        .padding = .{},
+    };
     self.mailbox = try ghostty.App.Mailbox.Queue.create(gpa);
     self.app = .{
         .vt = self,
     };
+    self.screen_mutex = .{};
 
     self.screen = try vaxis.AllocatingScreen.init(gpa, opts.size.cols, opts.size.rows);
 
@@ -101,16 +121,6 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.renderer_thread.setName("renderer") catch {};
 
     const full_config: ghostty.config.Config = .{};
-
-    // Create an initial size
-    const size: renderer.Size = .{
-        .screen = .{ .height = opts.size.y_pixel, .width = opts.size.x_pixel },
-        .cell = .{
-            .height = opts.size.y_pixel / opts.size.rows,
-            .width = opts.size.x_pixel / opts.size.cols,
-        },
-        .padding = .{},
-    };
 
     // Create our IO thread
     self.io_thread = try termio.Thread.init(gpa);
@@ -158,7 +168,7 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     };
 
     const termio_opts: termio.Options = .{
-        .size = size,
+        .size = self.size,
         .full_config = &full_config,
         .config = try termio.Termio.DerivedConfig.init(gpa, &full_config),
         .backend = .{ .exec = io_exec },
@@ -207,6 +217,8 @@ pub fn deinit(self: *Terminal) void {
     self.wakeup.deinit();
     self.loop.deinit();
 
+    self.screen_mutex.lock();
+    defer self.screen_mutex.unlock();
     self.screen.deinit(self.gpa);
 
     self.gpa.destroy(self.mailbox);
@@ -265,35 +277,40 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
         max,
     );
 
-    self.renderer_mutex.lock();
-    defer self.renderer_mutex.unlock();
+    self.screen_mutex.lock();
+    self.screen_mutex.unlock();
 
-    if (max.width != self.size.cols or max.height != self.size.rows) {
-        // trigger resize
-        self.size = .{
-            .rows = max.height,
-            .cols = max.width,
-            .x_pixel = max.width * 8,
-            .y_pixel = max.width * 16,
-        };
+    const grid = self.size.grid();
+    if (max.width != grid.columns or max.height != grid.rows) {
+        log.debug("size mismatch in draw: w={d}, h={d}, w_pix={d}, h_pix={d}, new: w={d}, h={d}, w_pix={d}, h_pix={d}", .{
+            grid.columns,
+            grid.rows,
+            self.size.cell.width,
+            self.size.cell.height,
+            max.width,
+            max.height,
+            ctx.cell_size.width,
+            ctx.cell_size.height,
+        });
         const size: renderer.Size = .{
-            .screen = .{ .height = self.size.y_pixel, .width = self.size.x_pixel },
+            .screen = .{
+                .height = max.height * ctx.cell_size.height,
+                .width = max.width * ctx.cell_size.width,
+            },
             .cell = .{
-                .height = self.size.y_pixel / self.size.rows,
-                .width = self.size.x_pixel / self.size.cols,
+                .height = ctx.cell_size.height,
+                .width = ctx.cell_size.width,
             },
             .padding = .{},
         };
-        self.io.queueMessage(.{ .resize = size }, .locked);
-        self.screen.deinit(self.gpa);
-        self.screen = try vaxis.AllocatingScreen.init(self.gpa, self.size.cols, self.size.rows);
+        self.io.queueMessage(.{ .resize = size }, .unlocked);
         return surface;
     }
 
     var row: u16 = 0;
-    while (row < self.size.rows) : (row += 1) {
+    while (row < grid.rows) : (row += 1) {
         var col: u16 = 0;
-        while (col < self.size.cols) : (col += 1) {
+        while (col < grid.columns) : (col += 1) {
             const cell = self.screen.readCell(col, row) orelse continue;
             surface.writeCell(col, row, cell);
         }
@@ -303,7 +320,6 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
 }
 
 fn vaxisKeyToGhosttyKey(key: vaxis.Key, press: bool) input.KeyEvent {
-    log.debug("vaxis key = {}", .{key});
     const action: input.Action = if (press) .press else .release;
     const physical_key = codepointToGhosttyKey(key.codepoint);
     const mods: input.Mods = .{
@@ -432,9 +448,22 @@ fn updateScreen(self: *Terminal) !void {
             return;
         }
 
-        if (self.size.cols != state.terminal.cols or self.size.rows != state.terminal.rows) {
+        const grid = self.size.grid();
+        if (grid.columns != state.terminal.cols or grid.rows != state.terminal.rows) {
             // Skip a frame if our size doesn't match
-            log.debug("size mismatch, skipping render frame", .{});
+            log.debug(
+                "size mismatch, skipping render frame old: w={d}, h={d}, w_pix={d}, h_pix={d}, new: w={d}, h={d}, w_pix={d}, h_pix={d}",
+                .{
+                    grid.columns,
+                    grid.rows,
+                    self.size.screen.width,
+                    self.size.screen.height,
+                    state.terminal.cols,
+                    state.terminal.rows,
+                    state.terminal.width_px,
+                    state.terminal.height_px,
+                },
+            );
             return;
         }
 
@@ -462,45 +491,70 @@ fn updateScreen(self: *Terminal) !void {
 
         break :critical screen;
     };
-
     defer screen.deinit();
+
+    self.screen_mutex.lock();
+    defer self.screen_mutex.unlock();
 
     var row_iter = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row: u16 = 0;
+    defer std.debug.assert(row == self.screen.height);
     while (row_iter.next()) |pin| {
+        std.debug.assert(row < self.screen.height);
         defer row += 1;
-        if (row >= self.screen.height) break;
         var col: u16 = 0;
+        defer std.debug.assert(col == self.screen.width);
         const cells = pin.cells(.all);
-        for (cells) |cell| {
+        for (cells) |*cell| {
+            std.debug.assert(col < self.screen.width);
             defer col += 1;
-            if (col >= self.screen.width) break;
-            const vx_style: vaxis.Style = if (cell.hasStyling())
-                ghosttyStyleToVaxisStyle(pin.style(&cell))
-            else
-                .{};
-            if (cell.hasText()) {
-                var buf: [256]u8 = undefined;
-                // TODO: count codepoint lengths, allocate a buffer, and then write?
-                var n = std.unicode.utf8Encode(cell.codepoint(), &buf) catch return error.OutOfMemory;
-                if (cell.hasGrapheme()) {
-                    if (pin.grapheme(&cell)) |cps| {
-                        for (cps) |cp| {
-                            n += std.unicode.utf8Encode(cp, buf[n..]) catch return error.OutOfMemory;
-                        }
+            if (cell.isEmpty()) {
+                self.screen.writeCell(col, row, .{});
+                continue;
+            }
+            const ghostty_style = pin.style(cell);
+            const vx_style: vaxis.Style = ghosttyStyleToVaxisStyle(ghostty_style, cell);
+            switch (cell.content_tag) {
+                .codepoint => {
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cell.codepoint(), &buf) catch unreachable;
+                    const char = buf[0..n];
+                    self.screen.writeCell(col, row, .{
+                        // Codepoints we assume are always correct for width
+                        .char = .{ .grapheme = char, .width = cell.gridWidth() },
+                        .style = vx_style,
+                    });
+                },
+                .codepoint_grapheme => {
+                    var len: u32 = 0;
+                    const cps = pin.grapheme(cell) orelse unreachable;
+
+                    len += std.unicode.utf8CodepointSequenceLength(cell.codepoint()) catch unreachable;
+                    for (cps) |cp| {
+                        len += std.unicode.utf8CodepointSequenceLength(cp) catch unreachable;
                     }
-                }
-                const char = buf[0..n];
-                const width: u16 = @intCast(vxfw.DrawContext.stringWidth(undefined, char));
-                self.screen.writeCell(col, row, .{
-                    .char = .{
-                        .grapheme = char,
-                        .width = @intCast(width),
-                    },
-                    .style = vx_style,
-                });
-            } else {
-                self.screen.writeCell(col, row, .{ .style = vx_style });
+
+                    var buf = try self.gpa.alloc(u8, len);
+                    defer self.gpa.free(buf);
+
+                    var n = std.unicode.utf8Encode(cell.codepoint(), buf) catch unreachable;
+                    for (cps) |cp| {
+                        n += std.unicode.utf8Encode(cp, buf[n..]) catch unreachable;
+                    }
+                    std.debug.assert(buf.len == n);
+                    // Graphemes we measure per vaxis
+                    const width: u16 = @intCast(vxfw.DrawContext.stringWidth(undefined, buf));
+                    self.screen.writeCell(col, row, .{
+                        .char = .{
+                            .grapheme = buf,
+                            .width = @intCast(width),
+                        },
+                        .style = vx_style,
+                    });
+                },
+                .bg_color_palette, .bg_color_rgb => {
+                    self.screen.writeCell(col, row, .{ .style = vx_style });
+                },
             }
         }
     }
@@ -609,16 +663,28 @@ fn setSelection(self: *Terminal, sel: ?terminal.Selection) !void {
     try self.io.terminal.screen.select(sel);
 }
 
-fn ghosttyStyleToVaxisStyle(style: ghostty.terminal.Style) vaxis.Style {
+fn ghosttyStyleToVaxisStyle(
+    style: ghostty.terminal.Style,
+    cell: *const ghostty.terminal.Cell,
+) vaxis.Style {
     const fg: vaxis.Color = switch (style.fg_color) {
         .none => .default,
         .palette => |v| .{ .index = v },
         .rgb => |v| .{ .rgb = .{ v.r, v.g, v.b } },
     };
-    const bg: vaxis.Color = switch (style.bg_color) {
-        .none => .default,
-        .palette => |v| .{ .index = v },
-        .rgb => |v| .{ .rgb = .{ v.r, v.g, v.b } },
+
+    const bg: vaxis.Color = switch (cell.content_tag) {
+        .bg_color_palette => .{ .index = cell.content.color_palette },
+        .bg_color_rgb => .{ .rgb = .{
+            cell.content.color_rgb.r,
+            cell.content.color_rgb.g,
+            cell.content.color_rgb.b,
+        } },
+        else => switch (style.bg_color) {
+            .none => .default,
+            .palette => |v| .{ .index = v },
+            .rgb => |v| .{ .rgb = .{ v.r, v.g, v.b } },
+        },
     };
     const ul: vaxis.Color = switch (style.underline_color) {
         .none => .default,
@@ -792,4 +858,14 @@ fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) any
     //
     // .password_input => |v| try self.passwordInput(v),
     // }
+}
+
+// Call this as a result of a resize event
+fn resize(self: *Terminal, size: renderer.Size) !void {
+    self.screen_mutex.lock();
+    defer self.screen_mutex.unlock();
+    self.size = size;
+    self.screen.deinit(self.gpa);
+    const grid = size.grid();
+    self.screen = try vaxis.AllocatingScreen.init(self.gpa, grid.columns, grid.rows);
 }

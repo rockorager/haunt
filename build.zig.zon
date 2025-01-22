@@ -3,12 +3,12 @@
     .version = "0.0.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "../ghostty",
-            .hash = "1220e6ae8a5c6bd4ec5f99b5d7d057391573f0186246a7c54fbbb838060455fc941d",
+            .url = "git+https://github.com/rockorager/ghostty?ref=vtvt#3c4383f1d347e0548fd1741f6aec5ed804392428",
+            .hash = "1220ab6ccc51f075bac6303b83577cb670d25a823c7dcf36d4116fa3c204f09d3a01",
         },
         .vaxis = .{
-            .url = "../libvaxis",
-            .hash = "1220ea2b1d50b51db89c47cff84760ca8239bea0f359a7e8d36b5b796d9f35e2d712",
+            .url = "git+https://github.com/rockorager/libvaxis#d6e26f1496001b6b6c0169d4c582955ee3b5fb65",
+            .hash = "1220f2f8f48ed8e98338866ed1fc471ceea71b36f80eaa4ef6c89169febebdd75933",
         },
         .iterm2_themes = .{
             .url = "https://github.com/mbadolato/iTerm2-Color-Schemes/archive/25cb3c3f52c7011cd8a599f8d144fc63f4409eb6.tar.gz",
