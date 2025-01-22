@@ -229,6 +229,7 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
     switch (event) {
         .init => try ctx.tick(8, self.widget()),
         .tick => {
+            try self.drainAppMailbox();
             var iter = self.renderer_mailbox.drain();
             defer iter.deinit();
             while (iter.next()) |msg| {
@@ -563,4 +564,158 @@ fn ghosttyStyleToVaxisStyle(style: ghostty.terminal.Style) vaxis.Style {
         .invisible = style.flags.invisible,
         .strikethrough = style.flags.strikethrough,
     };
+}
+
+fn drainAppMailbox(self: *Terminal) anyerror!void {
+    while (self.mailbox.pop()) |message| {
+        switch (message) {
+            .open_config => {},
+            .new_window => {},
+            .close => {},
+            .surface_message => |msg| try self.handleSurfaceMessage(msg.message),
+            .redraw_surface => {},
+            .redraw_inspector => {},
+            .quit => {},
+        }
+    }
+}
+
+fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) anyerror!void {
+    _ = self;
+    log.debug("surface message: {s}", .{@tagName(msg)});
+    // switch (msg) {
+    // .change_config => {},
+    //
+    // .set_title => |*v| {
+    //     // We ignore the message in case the title was set via config.
+    //     if (self.config.title != null) {
+    //         log.debug("ignoring title change request since static title is set via config", .{});
+    //         return;
+    //     }
+    //
+    //     // The ptrCast just gets sliceTo to return the proper type.
+    //     // We know that our title should end in 0.
+    //     const slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
+    //     log.debug("changing title \"{s}\"", .{slice});
+    //     try self.rt_app.performAction(
+    //         .{ .surface = self },
+    //         .set_title,
+    //         .{ .title = slice },
+    //     );
+    // },
+    //
+    // .report_title => |style| report_title: {
+    //     if (!self.config.title_report) {
+    //         log.info("report_title requested, but disabled via config", .{});
+    //         break :report_title;
+    //     }
+    //
+    //     const title: ?[:0]const u8 = self.rt_surface.getTitle();
+    //     const data = switch (style) {
+    //         .csi_21_t => try std.fmt.allocPrint(
+    //             self.alloc,
+    //             "\x1b]l{s}\x1b\\",
+    //             .{title orelse ""},
+    //         ),
+    //     };
+    //
+    //     // We always use an allocating message because we don't know
+    //     // the length of the title and this isn't a performance critical
+    //     // path.
+    //     self.io.queueMessage(.{
+    //         .write_alloc = .{
+    //             .alloc = self.alloc,
+    //             .data = data,
+    //         },
+    //     }, .unlocked);
+    // },
+    //
+    // .color_change => |change| {
+    //     // Notify our apprt, but don't send a mode 2031 DSR report
+    //     // because VT sequences were used to change the color.
+    //     try self.rt_app.performAction(
+    //         .{ .surface = self },
+    //         .color_change,
+    //         .{
+    //             .kind = switch (change.kind) {
+    //                 .background => .background,
+    //                 .foreground => .foreground,
+    //                 .cursor => .cursor,
+    //                 .palette => |v| @enumFromInt(v),
+    //             },
+    //             .r = change.color.r,
+    //             .g = change.color.g,
+    //             .b = change.color.b,
+    //         },
+    //     );
+    // },
+    //
+    // .set_mouse_shape => |shape| {
+    //     log.debug("changing mouse shape: {}", .{shape});
+    //     try self.rt_app.performAction(
+    //         .{ .surface = self },
+    //         .mouse_shape,
+    //         shape,
+    //     );
+    // },
+    //
+    // .clipboard_read => |clipboard| {
+    //     if (self.config.clipboard_read == .deny) {
+    //         log.info("application attempted to read clipboard, but 'clipboard-read' is set to deny", .{});
+    //         return;
+    //     }
+    //
+    //     try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
+    // },
+    //
+    // .clipboard_write => |w| switch (w.req) {
+    //     .small => |v| try self.clipboardWrite(v.data[0..v.len], w.clipboard_type),
+    //     .stable => |v| try self.clipboardWrite(v, w.clipboard_type),
+    //     .alloc => |v| {
+    //         defer v.alloc.free(v.data);
+    //         try self.clipboardWrite(v.data, w.clipboard_type);
+    //     },
+    // },
+    //
+    // .pwd_change => |w| {
+    //     defer w.deinit();
+    //
+    //     // We always allocate for this because we need to null-terminate.
+    //     const str = try self.alloc.dupeZ(u8, w.slice());
+    //     defer self.alloc.free(str);
+    //
+    //     try self.rt_app.performAction(
+    //         .{ .surface = self },
+    //         .pwd,
+    //         .{ .pwd = str },
+    //     );
+    // },
+    //
+    // .close => self.close(),
+    //
+    // // Close without confirmation.
+    // .child_exited => {
+    //     self.child_exited = true;
+    //     self.close();
+    // },
+    //
+    // .desktop_notification => |notification| {
+    //     if (!self.config.desktop_notifications) {
+    //         log.info("application attempted to display a desktop notification, but 'desktop-notifications' is disabled", .{});
+    //         return;
+    //     }
+    //
+    //     const title = std.mem.sliceTo(&notification.title, 0);
+    //     const body = std.mem.sliceTo(&notification.body, 0);
+    //     try self.showDesktopNotification(title, body);
+    // },
+    //
+    // .renderer_health => |health| self.updateRendererHealth(health),
+    //
+    // .report_color_scheme => |force| self.reportColorScheme(force),
+    //
+    // .present_surface => try self.presentSurface(),
+    //
+    // .password_input => |v| try self.passwordInput(v),
+    // }
 }
