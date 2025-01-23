@@ -245,9 +245,7 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             const key_event = vaxisKeyToGhosttyKey(key, event == .key_press);
             try self.handleKeyEvent(ctx, key_event);
         },
-        .mouse => |_| {
-            // TODO: mouse reports
-        },
+        .mouse => |_| try self.handleMouseEvent(ctx, event.mouse),
         else => {},
     }
 }
@@ -520,11 +518,7 @@ fn updateScreen(self: *Terminal) !void {
             // We can enter this branch when a resize is not complete yet
             break;
         }
-        if (!pin.isDirty()) {
-            continue;
-        }
-        // We have a dirty row. Redraw
-        if (!self.redraw.load(.unordered)) {
+        if (pin.isDirty()) {
             self.redraw.store(true, .unordered);
         }
 
@@ -932,5 +926,191 @@ fn notifyResize(self: *Terminal, size: renderer.Size) !void {
         self.renderer_mutex.lock();
         defer self.renderer_mutex.unlock();
         self.io.queueMessage(.{ .resize = size }, .unlocked);
+    }
+}
+
+fn handleMouseEvent(self: *Terminal, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) anyerror!void {
+    switch (self.io.terminal.flags.mouse_event) {
+        .none => return,
+        .x10 => @panic("TODO: x10 encoding"),
+        // We aren't reporting motion
+        .normal => if (mouse.type == .motion) return,
+        // We have to have a button for this to be reported
+        .button => if (mouse.button == .none) return,
+        .any => {},
+    }
+
+    const button: ?input.MouseButton = switch (mouse.button) {
+        .none => null,
+        .left => .left,
+        .middle => .middle,
+        .right => .right,
+        .wheel_up => .four,
+        .wheel_down => .five,
+        .wheel_right => .six,
+        .wheel_left => .seven,
+        .button_8 => .eight,
+        .button_9 => .nine,
+        .button_10 => .ten,
+        .button_11 => .eleven,
+    };
+
+    const mods: input.Mods = .{
+        .shift = mouse.mods.shift,
+        .ctrl = mouse.mods.ctrl,
+        .alt = mouse.mods.alt,
+    };
+
+    // Get the code we'll actually write
+    const button_code: u8 = code: {
+        var acc: u8 = 0;
+
+        // Determine our initial button value
+        if (button == null) {
+            // Null button means motion without a button pressed
+            acc = 3;
+        } else if (mouse.type == .release and
+            self.io.terminal.flags.mouse_format != .sgr and
+            self.io.terminal.flags.mouse_format != .sgr_pixels)
+        {
+            // Release is 3. It is NOT 3 in SGR mode because SGR can tell
+            // the application what button was released.
+            acc = 3;
+        } else {
+            acc = switch (button.?) {
+                .left => 0,
+                .middle => 1,
+                .right => 2,
+                .four => 64,
+                .five => 65,
+                .six => 66,
+                .seven => 67,
+                else => return, // unsupported
+            };
+        }
+
+        // X10 doesn't have modifiers
+        if (self.io.terminal.flags.mouse_event != .x10) {
+            if (mods.shift) acc += 4;
+            if (mods.alt) acc += 8;
+            if (mods.ctrl) acc += 16;
+        }
+
+        // Motion adds another bit
+        if (mouse.type == .motion or mouse.type == .drag) acc += 32;
+
+        break :code acc;
+    };
+
+    // From here on out, we need a redraw and we consume the event
+    ctx.consumeAndRedraw();
+    switch (self.io.terminal.flags.mouse_format) {
+        .x10 => {
+            if (mouse.col > 222 or mouse.row > 222) {
+                log.info("X10 mouse format can only encode X/Y up to 223", .{});
+                return;
+            }
+
+            // + 1 below is because our x/y is 0-indexed and the protocol wants 1
+            var data: termio.Message.WriteReq.Small.Array = undefined;
+            std.debug.assert(data.len >= 6);
+            data[0] = '\x1b';
+            data[1] = '[';
+            data[2] = 'M';
+            data[3] = 32 + button_code;
+            data[4] = 32 + @as(u8, @intCast(mouse.col)) + 1;
+            data[5] = 32 + @as(u8, @intCast(mouse.row)) + 1;
+
+            // Ask our IO thread to write the data
+            self.io.queueMessage(.{ .write_small = .{
+                .data = data,
+                .len = 6,
+            } }, .locked);
+        },
+
+        .utf8 => {
+            // Maximum of 12 because at most we have 2 fully UTF-8 encoded chars
+            var data: termio.Message.WriteReq.Small.Array = undefined;
+            std.debug.assert(data.len >= 12);
+            data[0] = '\x1b';
+            data[1] = '[';
+            data[2] = 'M';
+
+            // The button code will always fit in a single u8
+            data[3] = 32 + button_code;
+
+            // UTF-8 encode the x/y
+            var i: usize = 4;
+            i += try std.unicode.utf8Encode(@intCast(32 + mouse.col + 1), data[i..]);
+            i += try std.unicode.utf8Encode(@intCast(32 + mouse.row + 1), data[i..]);
+
+            // Ask our IO thread to write the data
+            self.io.queueMessage(.{ .write_small = .{
+                .data = data,
+                .len = @intCast(i),
+            } }, .locked);
+        },
+
+        .sgr => {
+            // Final character to send in the CSI
+            const final: u8 = if (mouse.type == .release) 'm' else 'M';
+
+            // Response always is at least 4 chars, so this leaves the
+            // remainder for numbers which are very large...
+            var data: termio.Message.WriteReq.Small.Array = undefined;
+            const resp = try std.fmt.bufPrint(&data, "\x1B[<{d};{d};{d}{c}", .{
+                button_code,
+                mouse.col + 1,
+                mouse.row + 1,
+                final,
+            });
+
+            // Ask our IO thread to write the data
+            self.io.queueMessage(.{ .write_small = .{
+                .data = data,
+                .len = @intCast(resp.len),
+            } }, .locked);
+        },
+
+        .urxvt => {
+            // Response always is at least 4 chars, so this leaves the
+            // remainder for numbers which are very large...
+            var data: termio.Message.WriteReq.Small.Array = undefined;
+            const resp = try std.fmt.bufPrint(&data, "\x1B[{d};{d};{d}M", .{
+                32 + button_code,
+                mouse.col + 1,
+                mouse.row + 1,
+            });
+
+            // Ask our IO thread to write the data
+            self.io.queueMessage(.{ .write_small = .{
+                .data = data,
+                .len = @intCast(resp.len),
+            } }, .locked);
+        },
+
+        .sgr_pixels => {
+            // Final character to send in the CSI
+            const final: u8 = if (mouse.type == .release) 'm' else 'M';
+
+            const x_pix = (self.size.cell.width * (mouse.col + 1)) + mouse.xoffset;
+            const y_pix = (self.size.cell.height * (mouse.row + 1)) + mouse.yoffset;
+
+            // Response always is at least 4 chars, so this leaves the
+            // remainder for numbers which are very large...
+            var data: termio.Message.WriteReq.Small.Array = undefined;
+            const resp = try std.fmt.bufPrint(&data, "\x1B[<{d};{d};{d}{c}", .{
+                button_code,
+                x_pix,
+                y_pix,
+                final,
+            });
+
+            // Ask our IO thread to write the data
+            self.io.queueMessage(.{ .write_small = .{
+                .data = data,
+                .len = @intCast(resp.len),
+            } }, .locked);
+        },
     }
 }
