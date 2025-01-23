@@ -11,9 +11,8 @@ pub const ghostty_options = struct {
     pub const runtime = @import("Terminal.zig");
 };
 
-pub const std_options: std.Options = .{
-    .log_level = .debug,
-};
+// Animation transition time for moving between panes
+const transition_time_ms = 100;
 
 const Model = struct {
     vts: [4]Terminal,
@@ -77,14 +76,14 @@ const Model = struct {
             .focus_in => return ctx.requestFocus(self.focusedVt().widget()),
             .tick => {
                 if (self.offset < 0) {
-                    const speed_cells_per_ms: i17 = @max(1, self.win_width / 200);
+                    const speed_cells_per_ms: i17 = @max(1, self.win_width / transition_time_ms);
                     self.offset += speed_cells_per_ms * 8;
                     self.offset = @min(self.offset, 0);
                     ctx.redraw = true;
                     return ctx.tick(8, self.widget());
                 }
                 if (self.offset > 0) {
-                    const speed_cells_per_ms: i17 = @max(1, self.win_width / 200);
+                    const speed_cells_per_ms: i17 = @max(1, self.win_width / transition_time_ms);
                     self.offset -= speed_cells_per_ms * 8;
                     self.offset = @max(self.offset, 0);
                     ctx.redraw = true;
