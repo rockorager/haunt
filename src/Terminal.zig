@@ -490,6 +490,24 @@ fn updateScreen(self: *Terminal) !void {
             self.cursor_state = null;
         }
 
+        // Reset the dirty flags in the terminal and screen. We assume
+        // that our rebuild will be successful since so we optimize for
+        // success and reset while we hold the lock. This is much easier
+        // than coordinating row by row or as changes are persisted.
+        state.terminal.flags.dirty = .{};
+        state.terminal.screen.dirty = .{};
+        {
+            var it = state.terminal.screen.pages.pageIterator(
+                .right_down,
+                .{ .screen = .{} },
+                null,
+            );
+            while (it.next()) |chunk| {
+                var dirty_set = chunk.node.data.dirtyBitSet();
+                dirty_set.unsetAll();
+            }
+        }
+
         break :critical screen;
     };
     defer screen.deinit();
@@ -500,15 +518,23 @@ fn updateScreen(self: *Terminal) !void {
         defer row += 1;
         if (row >= self.screen.height) {
             // We can enter this branch when a resize is not complete yet
+            break;
+        }
+        if (!pin.isDirty()) {
             continue;
         }
+        // We have a dirty row. Redraw
+        if (!self.redraw.load(.unordered)) {
+            self.redraw.store(true, .unordered);
+        }
+
         var col: u16 = 0;
         const cells = pin.cells(.all);
         for (cells) |*cell| {
             defer col += 1;
             if (col >= self.screen.width) {
                 // We can enter this branch when a resize is not complete yet
-                continue;
+                break;
             }
             if (cell.isEmpty()) {
                 self.screen.writeCell(col, row, .{});
