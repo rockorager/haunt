@@ -4,12 +4,10 @@ const vaxis = @import("vaxis");
 
 const Terminal = @import("Terminal.zig");
 
-const renderer = @import("renderer.zig");
-
 const vxfw = vaxis.vxfw;
 
 pub const ghostty_options = struct {
-    pub const Renderer = renderer.Vaxis;
+    pub const Renderer = Terminal.Renderer;
     pub const runtime = @import("Terminal.zig");
 };
 

@@ -37,7 +37,14 @@ pub const App = struct {
         }
     }
 };
+
+/// This is an empty Decl meant to satisfy libghostty
 pub const Surface = struct {};
+
+/// This is an empty Decl meant to satisfy libghostty
+pub const Renderer = struct {
+    pub const DerivedConfig = struct {};
+};
 
 pub const Options = struct {
     command: ?[]const u8 = null,
