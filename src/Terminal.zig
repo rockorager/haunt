@@ -166,7 +166,6 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
         .renderer_state = &self.renderer_state,
         .renderer_wakeup = self.wakeup,
         .renderer_mailbox = self.renderer_mailbox,
-        // TODO:
         .surface_mailbox = surface_mailbox,
         .mailbox = io_mailbox,
     };
@@ -231,7 +230,6 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
 }
 
 pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     switch (event) {
         .init => try ctx.tick(8, self.widget()),
         .tick => {
@@ -256,7 +254,6 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
 }
 
 pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     const max = ctx.max.size();
 
     var surface = try vxfw.Surface.init(
@@ -408,7 +405,6 @@ fn render(
     _: *xev.Completion,
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     _ = r catch |err| {
         log.err("error in wakeup err={}", .{err});
         return .rearm;
@@ -430,7 +426,6 @@ fn render(
 }
 
 fn updateScreen(self: *Terminal) !void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     var screen: terminal.Screen = critical: {
         // Take the lock in the critical path
         self.renderer_mutex.lock();
@@ -471,8 +466,12 @@ fn updateScreen(self: *Terminal) !void {
 
         // TODO: kitty images. See ghostty repo: src/renderer/OpenGL.zig:803
 
+        const top_left = state.terminal.screen.pages.getTopLeft(.viewport);
+        const cursor_pin_y = state.terminal.screen.cursor.page_pin.y;
+        const cursor_row: u16 = cursor_pin_y -| top_left.y;
+
         // Set our cursor visible state while we have the lock
-        if (state.terminal.modes.get(.cursor_visible)) {
+        if (state.terminal.modes.get(.cursor_visible) and cursor_row < grid.rows) {
             const blink = state.terminal.modes.get(.cursor_blinking);
             const shape: vaxis.Cell.CursorShape = switch (state.terminal.screen.cursor.cursor_style) {
                 .bar => if (blink) .beam_blink else .beam,
@@ -480,8 +479,8 @@ fn updateScreen(self: *Terminal) !void {
                 .underline => if (blink) .underline_blink else .underline,
             };
             self.cursor_state = .{
-                .col = state.terminal.screen.cursor.x,
-                .row = state.terminal.screen.cursor.y,
+                .col = screen.cursor.x,
+                .row = screen.cursor.y,
                 .shape = shape,
             };
         } else {
@@ -673,7 +672,6 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
 }
 
 fn renderThread(self: *Terminal) void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     self.loop.run(.until_done) catch |err| {
         log.err("err = {}", .{err});
     };
@@ -730,7 +728,6 @@ fn ghosttyStyleToVaxisStyle(
 }
 
 fn drainAppMailbox(self: *Terminal) anyerror!void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     while (self.mailbox.pop()) |message| {
         switch (message) {
             .open_config => {},
@@ -756,7 +753,6 @@ fn drainRendererMailbox(self: *Terminal) anyerror!void {
 }
 
 fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) anyerror!void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     _ = self;
     log.debug("surface message: {s}", .{@tagName(msg)});
     // switch (msg) {
@@ -898,8 +894,6 @@ fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) any
 
 // Resize the internal screen and update the internal size
 fn resize(self: *Terminal, size: renderer.Size) !void {
-    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
-
     // Reset the resize message
     defer self.resize_msg_sent.store(false, .unordered);
 
@@ -931,7 +925,8 @@ fn notifyResize(self: *Terminal, size: renderer.Size) !void {
 
 fn handleMouseEvent(self: *Terminal, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) anyerror!void {
     switch (self.io.terminal.flags.mouse_event) {
-        .none => return,
+        // If we have no reporting, we will try for a wheel scroll
+        .none => return self.handleWheelScroll(ctx, mouse),
         .x10 => @panic("TODO: x10 encoding"),
         // We aren't reporting motion
         .normal => if (mouse.type == .motion) return,
@@ -1113,4 +1108,67 @@ fn handleMouseEvent(self: *Terminal, ctx: *vxfw.EventContext, mouse: vaxis.Mouse
             } }, .locked);
         },
     }
+}
+
+fn handleWheelScroll(self: *Terminal, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) anyerror!void {
+    switch (mouse.button) {
+        .wheel_up => {},
+        .wheel_down => {},
+        else => return,
+    }
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    ctx.consumeAndRedraw();
+
+    // If we have an active mouse reporting mode, clear the selection.
+    // The selection can occur if the user uses the shift mod key to
+    // override mouse grabbing from the window.
+    if (self.io.terminal.flags.mouse_event != .none) {
+        try self.setSelection(null);
+    }
+
+    // If we're in alternate screen with alternate scroll enabled, then
+    // we convert to cursor keys. This only happens if we're:
+    // (1) alt screen (2) no explicit mouse reporting and (3) alt
+    // scroll mode enabled.
+    if (self.io.terminal.active_screen == .alternate and
+        self.io.terminal.flags.mouse_event == .none and
+        self.io.terminal.modes.get(.mouse_alternate_scroll))
+    {
+        // When we send mouse events as cursor keys we always
+        // clear the selection.
+        try self.setSelection(null);
+
+        const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
+            // cursor key: application mode
+            break :seq switch (mouse.button) {
+                .wheel_up => "\x1bOA",
+                .wheel_down => "\x1bOB",
+                else => unreachable,
+            };
+        } else seq: {
+            // cursor key: normal mode
+            break :seq switch (mouse.button) {
+                .wheel_up => "\x1b[A",
+                .wheel_down => "\x1b[B",
+                else => unreachable,
+            };
+        };
+        self.io.queueMessage(.{ .write_stable = seq }, .locked);
+
+        return;
+    }
+
+    const delta: isize = switch (mouse.button) {
+        .wheel_up => -1,
+        .wheel_down => 1,
+        else => unreachable,
+    };
+
+    // Modify our viewport, this requires a lock since it affects
+    // rendering. We have to switch signs here because our delta
+    // is negative down but our viewport is positive down.
+    try self.io.terminal.scrollViewport(.{ .delta = delta });
+
+    try self.wakeup.notify();
 }
