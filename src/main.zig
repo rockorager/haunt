@@ -11,6 +11,10 @@ pub const ghostty_options = struct {
     pub const runtime = @import("Terminal.zig");
 };
 
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
+
 const Model = struct {
     vts: [4]Terminal,
     focused: u2 = 0,

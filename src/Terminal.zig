@@ -19,23 +19,7 @@ const Terminal = @This();
 const log = std.log.scoped(.terminal_widget);
 
 pub const App = struct {
-    vt: *Terminal,
-
-    pub fn wakeup(self: *App) void {
-        log.debug("app wakeup", .{});
-        var iter = self.vt.renderer_mailbox.drain();
-        defer iter.deinit();
-        while (iter.next()) |message| {
-            switch (message) {
-                .resize => |size| {
-                    self.vt.resize(size) catch |err| {
-                        log.err("couldn't resize {}", .{err});
-                    };
-                },
-                else => {},
-            }
-        }
-    }
+    pub fn wakeup(_: *App) void {}
 };
 
 /// This is an empty Decl meant to satisfy libghostty
@@ -86,6 +70,7 @@ wakeup_c: xev.Completion = .{},
 
 redraw: std.atomic.Value(bool),
 quit: std.atomic.Value(bool),
+resize_msg_sent: std.atomic.Value(bool),
 
 cursor_state: ?vxfw.CursorState = null,
 
@@ -101,15 +86,14 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
         .padding = .{},
     };
     self.mailbox = try ghostty.App.Mailbox.Queue.create(gpa);
-    self.app = .{
-        .vt = self,
-    };
+    self.app = .{};
     self.screen_mutex = .{};
 
     self.screen = try vaxis.AllocatingScreen.init(gpa, opts.size.cols, opts.size.rows);
 
     self.redraw = std.atomic.Value(bool).init(false);
     self.quit = std.atomic.Value(bool).init(false);
+    self.resize_msg_sent = std.atomic.Value(bool).init(false);
 
     // Create our event loop.
     self.loop = try xev.Loop.init(.{});
@@ -118,7 +102,7 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.wakeup = try xev.Async.init();
     errdefer self.wakeup.deinit();
 
-    self.wakeup.wait(&self.loop, &self.wakeup_c, Terminal, self, queueRender);
+    self.wakeup.wait(&self.loop, &self.wakeup_c, Terminal, self, render);
     // Start our renderer thread
     self.renderer_thread = try std.Thread.spawn(
         .{},
@@ -198,7 +182,9 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     );
     self.io_thr.setName("io") catch {};
 
-    self.io.queueMessage(.{ .resize = self.io.size }, .unlocked);
+    self.renderer_mutex.lock();
+    defer self.renderer_mutex.unlock();
+    self.io.queueMessage(.{ .resize = self.io.size }, .locked);
 }
 
 pub fn deinit(self: *Terminal) void {
@@ -208,9 +194,6 @@ pub fn deinit(self: *Terminal) void {
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
-    self.io_thread.deinit();
-    self.io.deinit();
-    self.io.config.deinit();
     renderer: {
         defer self.loop.stop();
         self.quit.store(true, .unordered);
@@ -220,6 +203,9 @@ pub fn deinit(self: *Terminal) void {
         };
         self.renderer_thread.join();
     }
+    self.io_thread.deinit();
+    self.io.deinit();
+    self.io.config.deinit();
     self.gpa.destroy(self.renderer_mailbox);
     self.wakeup.deinit();
     self.loop.deinit();
@@ -245,17 +231,14 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
 }
 
 pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     switch (event) {
         .init => try ctx.tick(8, self.widget()),
         .tick => {
             try self.drainAppMailbox();
-            var iter = self.renderer_mailbox.drain();
-            defer iter.deinit();
-            while (iter.next()) |msg| {
-                // TODO: renderermailbox?
-                log.debug("renderer: {s}", .{@tagName(msg)});
-            }
-            ctx.redraw = true;
+            try self.drainRendererMailbox();
+            // Set redraw if it was false
+            ctx.redraw = ctx.redraw or self.redraw.load(.unordered);
             try ctx.tick(8, self.widget());
         },
         .key_press, .key_release => |key| {
@@ -275,6 +258,7 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
 }
 
 pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     const max = ctx.max.size();
 
     var surface = try vxfw.Surface.init(
@@ -285,7 +269,8 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
     surface.focusable = true;
 
     self.screen_mutex.lock();
-    self.screen_mutex.unlock();
+    defer self.screen_mutex.unlock();
+    self.redraw.store(false, .unordered);
 
     const grid = self.size.grid();
     if (max.width != grid.columns or max.height != grid.rows) {
@@ -310,16 +295,20 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
             },
             .padding = .{},
         };
-        self.io.queueMessage(.{ .resize = size }, .unlocked);
-        // HACK: we should return the empty surface but we have some resize issues
-        // return surface;
+        try self.notifyResize(size);
+        return surface;
     }
 
     var row: u16 = 0;
     while (row < grid.rows) : (row += 1) {
         var col: u16 = 0;
         while (col < grid.columns) : (col += 1) {
-            const cell = self.screen.readCell(col, row) orelse continue;
+            var cell = self.screen.readCell(col, row) orelse continue;
+            // Dupe the contents of the grapheme because the lifetime can change before it is
+            // rendered
+            cell.char.grapheme = try ctx.arena.dupe(u8, cell.char.grapheme);
+            cell.link.uri = try ctx.arena.dupe(u8, cell.link.uri);
+            cell.link.params = try ctx.arena.dupe(u8, cell.link.params);
             surface.writeCell(col, row, cell);
         }
     }
@@ -415,12 +404,13 @@ fn codepointToGhosttyKey(cp: u21) input.Key {
     };
 }
 
-fn queueRender(
+fn render(
     maybe_self: ?*Terminal,
     _: *xev.Loop,
     _: *xev.Completion,
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     _ = r catch |err| {
         log.err("error in wakeup err={}", .{err});
         return .rearm;
@@ -442,6 +432,7 @@ fn queueRender(
 }
 
 fn updateScreen(self: *Terminal) !void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     var screen: terminal.Screen = critical: {
         // Take the lock in the critical path
         self.renderer_mutex.lock();
@@ -474,6 +465,9 @@ fn updateScreen(self: *Terminal) !void {
             return;
         }
 
+        self.screen_mutex.lock();
+        defer self.screen_mutex.unlock();
+
         var screen = try state.terminal.screen.clone(self.gpa, .{ .viewport = .{} }, null);
         errdefer screen.deinit();
 
@@ -500,21 +494,22 @@ fn updateScreen(self: *Terminal) !void {
     };
     defer screen.deinit();
 
-    self.screen_mutex.lock();
-    defer self.screen_mutex.unlock();
-
     var row_iter = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row: u16 = 0;
-    defer std.debug.assert(row == self.screen.height);
     while (row_iter.next()) |pin| {
-        std.debug.assert(row < self.screen.height);
         defer row += 1;
+        if (row >= self.screen.height) {
+            // We can enter this branch when a resize is not complete yet
+            continue;
+        }
         var col: u16 = 0;
-        defer std.debug.assert(col == self.screen.width);
         const cells = pin.cells(.all);
         for (cells) |*cell| {
-            std.debug.assert(col < self.screen.width);
             defer col += 1;
+            if (col >= self.screen.width) {
+                // We can enter this branch when a resize is not complete yet
+                continue;
+            }
             if (cell.isEmpty()) {
                 self.screen.writeCell(col, row, .{});
                 continue;
@@ -658,6 +653,7 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
 }
 
 fn renderThread(self: *Terminal) void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     self.loop.run(.until_done) catch |err| {
         log.err("err = {}", .{err});
     };
@@ -714,6 +710,7 @@ fn ghosttyStyleToVaxisStyle(
 }
 
 fn drainAppMailbox(self: *Terminal) anyerror!void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     while (self.mailbox.pop()) |message| {
         switch (message) {
             .open_config => {},
@@ -727,7 +724,19 @@ fn drainAppMailbox(self: *Terminal) anyerror!void {
     }
 }
 
+fn drainRendererMailbox(self: *Terminal) anyerror!void {
+    var iter = self.renderer_mailbox.drain();
+    defer iter.deinit();
+    while (iter.next()) |message| {
+        switch (message) {
+            .resize => |size| try self.resize(size),
+            else => {},
+        }
+    }
+}
+
 fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) anyerror!void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
     _ = self;
     log.debug("surface message: {s}", .{@tagName(msg)});
     // switch (msg) {
@@ -867,13 +876,35 @@ fn handleSurfaceMessage(self: *Terminal, msg: ghostty.apprt.surface.Message) any
     // }
 }
 
-// Call this as a result of a resize event
+// Resize the internal screen and update the internal size
 fn resize(self: *Terminal, size: renderer.Size) !void {
+    log.debug("fn='{s}'::{d}", .{ @src().fn_name, @src().line });
+
+    // Reset the resize message
+    defer self.resize_msg_sent.store(false, .unordered);
+
+    // Lock the renderer
+    self.renderer_mutex.lock();
+    defer self.renderer_mutex.unlock();
+
+    // We can safely set the size now
+    self.size = size;
+
+    // Lock the screen
     self.screen_mutex.lock();
     defer self.screen_mutex.unlock();
-    self.size = size;
     self.screen.deinit(self.gpa);
     const grid = size.grid();
     self.screen = try vaxis.AllocatingScreen.init(self.gpa, grid.columns, grid.rows);
     self.redraw.store(true, .unordered);
+    try self.wakeup.notify();
+}
+
+fn notifyResize(self: *Terminal, size: renderer.Size) !void {
+    if (!self.resize_msg_sent.load(.unordered)) {
+        self.resize_msg_sent.store(true, .unordered);
+        self.renderer_mutex.lock();
+        defer self.renderer_mutex.unlock();
+        self.io.queueMessage(.{ .resize = size }, .unlocked);
+    }
 }
