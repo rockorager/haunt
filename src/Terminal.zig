@@ -1,10 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ghostty = @import("ghostty");
 const xev = @import("xev");
 const vaxis = @import("vaxis");
 
 const apprt = ghostty.apprt;
-const builtin = std.builtin;
 const input = ghostty.input;
 const renderer = ghostty.renderer;
 const terminal = ghostty.terminal;
@@ -76,6 +76,9 @@ cursor_state: ?vxfw.CursorState = null,
 mouse_shape: vaxis.Mouse.Shape = .default,
 password_input: bool = false,
 
+/// Initial command this terminal was started with
+command: []const u8,
+
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.gpa = gpa;
@@ -126,9 +129,15 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
         .terminal = &self.io.terminal,
     };
 
+    self.command = if (opts.command) |cmd|
+        // Dupe it so we don't have to track whether we allocated from shell or not
+        try gpa.dupe(u8, cmd)
+    else
+        try getShell(gpa);
+
     // initialize our IO backend
     var io_exec = try termio.Exec.init(gpa, .{
-        .command = opts.command,
+        .command = self.command,
         .shell_integration = full_config.@"shell-integration",
         .shell_integration_features = full_config.@"shell-integration-features",
         .working_directory = full_config.@"working-directory",
@@ -216,6 +225,7 @@ pub fn deinit(self: *Terminal) void {
     self.screen.deinit(self.gpa);
 
     self.gpa.destroy(self.mailbox);
+    self.gpa.free(self.command);
 }
 
 pub fn widget(self: *Terminal) vxfw.Widget {
@@ -1194,4 +1204,27 @@ fn handleWheelScroll(self: *Terminal, ctx: *vxfw.EventContext, mouse: vaxis.Mous
     try self.io.terminal.scrollViewport(.{ .delta = delta });
 
     try self.wakeup.notify();
+}
+
+/// Find the default shell command
+fn getShell(gpa: Allocator) ![]const u8 {
+    const shell_env = try std.process.getEnvVarOwned(gpa, "SHELL");
+    if (shell_env.len > 0) {
+        log.info("default shell source=env value={s}", .{shell_env});
+        return shell_env;
+    }
+
+    switch (builtin.os.tag) {
+        .windows => return "cmd.exe",
+        else => {
+            // We need the passwd entry for the remainder
+            const pw = try ghostty.os.passwd.get(gpa);
+
+            const sh = pw.shell orelse {
+                log.warn("no default shell found, will default to using sh", .{});
+                return "sh";
+            };
+            return sh;
+        },
+    }
 }

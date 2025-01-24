@@ -200,7 +200,7 @@ pub fn main() !void {
 
     for (model.vts, 0..) |_, i| {
         const vt = &model.vts[i];
-        try vt.init(gpa.allocator(), .{ .command = "fish" });
+        try vt.init(gpa.allocator(), .{});
     }
 
     defer {
