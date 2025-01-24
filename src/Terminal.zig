@@ -89,6 +89,12 @@ command: []const u8,
 /// Resources directory, if we found one
 resources_dir: ?[]const u8,
 
+/// Title of the terminal
+title: []const u8,
+
+/// If the child process in the terminal has exited
+child_exited: bool = false,
+
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.gpa = gpa;
@@ -109,6 +115,8 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.redraw = std.atomic.Value(bool).init(false);
     self.quit = std.atomic.Value(bool).init(false);
     self.resize_msg_sent = std.atomic.Value(bool).init(false);
+
+    self.title = "";
 
     // Create our event loop.
     self.loop = try xev.Loop.init(.{});
@@ -241,6 +249,8 @@ pub fn deinit(self: *Terminal) void {
     if (self.resources_dir) |resources_dir| {
         self.gpa.free(resources_dir);
     }
+
+    self.gpa.free(self.title);
 }
 
 pub fn widget(self: *Terminal) vxfw.Widget {
@@ -710,7 +720,6 @@ fn handleKeyEvent(self: *Terminal, ctx: *vxfw.EventContext, event: input.KeyEven
     if (self.io.terminal.modes.get(.disable_keyboard)) return;
 
     const write_req = try self.encodeKey(event) orelse {
-        log.warn("key couldn't be encoded: {}", .{event});
         return;
     };
     errdefer write_req.deinit();
@@ -751,7 +760,6 @@ fn encodeKey(self: *Terminal, event: input.KeyEvent) !?termio.Message.WriteReq {
         };
     };
 
-    log.warn("kitty flags: {}", .{enc.kitty_flags});
     const write_req: termio.Message.WriteReq = req: {
         // Try to write the input into a small array. This fits almost
         // every scenario. Larger situations can happen due to long
@@ -881,49 +889,46 @@ fn handleSurfaceMessage(
     switch (msg) {
         // .change_config => {},
         //
-        // .set_title => |*v| {
-        //     // We ignore the message in case the title was set via config.
-        //     if (self.config.title != null) {
-        //         log.debug("ignoring title change request since static title is set via config", .{});
-        //         return;
-        //     }
-        //
-        //     // The ptrCast just gets sliceTo to return the proper type.
-        //     // We know that our title should end in 0.
-        //     const slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
-        //     log.debug("changing title \"{s}\"", .{slice});
-        //     try self.rt_app.performAction(
-        //         .{ .surface = self },
-        //         .set_title,
-        //         .{ .title = slice },
-        //     );
-        // },
-        //
-        // .report_title => |style| report_title: {
-        //     if (!self.config.title_report) {
-        //         log.info("report_title requested, but disabled via config", .{});
-        //         break :report_title;
-        //     }
-        //
-        //     const title: ?[:0]const u8 = self.rt_surface.getTitle();
-        //     const data = switch (style) {
-        //         .csi_21_t => try std.fmt.allocPrint(
-        //             self.alloc,
-        //             "\x1b]l{s}\x1b\\",
-        //             .{title orelse ""},
-        //         ),
-        //     };
-        //
-        //     // We always use an allocating message because we don't know
-        //     // the length of the title and this isn't a performance critical
-        //     // path.
-        //     self.io.queueMessage(.{
-        //         .write_alloc = .{
-        //             .alloc = self.alloc,
-        //             .data = data,
-        //         },
-        //     }, .unlocked);
-        // },
+        .set_title => |*v| {
+            self.gpa.free(self.title);
+            // We ignore the message in case the title was set via config.
+            // if (self.config.title != null) {
+            //     log.debug("ignoring title change request since static title is set via config", .{});
+            //     return;
+            // }
+
+            // The ptrCast just gets sliceTo to return the proper type.
+            // We know that our title should end in 0.
+            const slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
+            log.debug("changing title \"{s}\"", .{slice});
+            self.title = try self.gpa.dupe(u8, slice);
+            ctx.redraw = true;
+        },
+
+        .report_title => |style| {
+            // if (!self.config.title_report) {
+            //     log.info("report_title requested, but disabled via config", .{});
+            //     break :report_title;
+            // }
+
+            const data = switch (style) {
+                .csi_21_t => try std.fmt.allocPrint(
+                    self.gpa,
+                    "\x1b]l{s}\x1b\\",
+                    .{self.title},
+                ),
+            };
+
+            // We always use an allocating message because we don't know
+            // the length of the title and this isn't a performance critical
+            // path.
+            self.io.queueMessage(.{
+                .write_alloc = .{
+                    .alloc = self.gpa,
+                    .data = data,
+                },
+            }, .unlocked);
+        },
         //
         // .color_change => |change| {
         //     // Notify our apprt, but don't send a mode 2031 DSR report
@@ -996,13 +1001,12 @@ fn handleSurfaceMessage(
         //     );
         // },
         //
-        // .close => self.close(),
-        //
-        // // Close without confirmation.
-        // .child_exited => {
-        //     self.child_exited = true;
-        //     self.close();
-        // },
+        .close => try self.close(ctx),
+        // Close without confirmation.
+        .child_exited => {
+            self.child_exited = true;
+            try self.close(ctx);
+        },
         //
         // .desktop_notification => |notification| {
         //     if (!self.config.desktop_notifications) {
@@ -1330,5 +1334,21 @@ fn getShell(gpa: Allocator) ![]const u8 {
             };
             return sh;
         },
+    }
+}
+
+pub fn close(self: *Terminal, maybe_ctx: ?*vxfw.EventContext) anyerror!void {
+    if (self.child_exited) return;
+
+    {
+        self.renderer_mutex.lock();
+        defer self.renderer_mutex.unlock();
+        if (!self.io.terminal.cursorIsAtPrompt()) {
+            log.warn("TODO: confirm close", .{});
+        }
+    }
+    self.deinit();
+    if (maybe_ctx) |ctx| {
+        ctx.redraw = true;
     }
 }

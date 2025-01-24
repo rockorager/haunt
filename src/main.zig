@@ -206,7 +206,10 @@ pub fn main() !void {
     defer {
         for (model.vts, 0..) |_, i| {
             const vt = &model.vts[i];
-            vt.deinit();
+            vt.close(null) catch {
+                vt.deinit();
+            };
+            // vt.deinit();
         }
     }
 
