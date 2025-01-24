@@ -3,8 +3,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/rockorager/ghostty?ref=vtvt#79a89a06ab2f41d1471a54e87de6b5004b59f515",
-            .hash = "1220a7dc5226f710a265f224f55cd6325c8e9d27a79efb4b3a5525c6427e2f2ae7a1",
+            .url = "git+https://github.com/rockorager/ghostty?ref=vtvt#2c9957ea2cb1d5c675394d29f7077c13f30b3f35",
+            .hash = "12200ff4b5ac137a09a352e2921056efe5c27c1434d74ed40d81da1168e7bd2b981e",
         },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis#6afd4786ebc757e8860a1afd20bb0510d74ab74f",

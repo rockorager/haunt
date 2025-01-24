@@ -36,6 +36,11 @@ pub const Options = struct {
     command: ?[]const u8 = null,
     term: []const u8 = "ghostty",
     size: vaxis.Winsize = .{ .cols = 80, .rows = 24, .x_pixel = 800, .y_pixel = 480 },
+    shell_integration_features: ghostty.config.ShellIntegrationFeatures = .{
+        .cursor = false,
+        .sudo = false,
+        .title = true,
+    },
 };
 
 const Config = struct {};
@@ -80,6 +85,9 @@ password_input: bool = false,
 
 /// Initial command this terminal was started with
 command: []const u8,
+
+/// Resources directory, if we found one
+resources_dir: ?[]const u8,
 
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
@@ -137,13 +145,15 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     else
         try getShell(gpa);
 
+    self.resources_dir = try ghostty.os.resourcesDir(gpa);
+
     // initialize our IO backend
     var io_exec = try termio.Exec.init(gpa, .{
         .command = self.command,
         .shell_integration = full_config.@"shell-integration",
         .shell_integration_features = full_config.@"shell-integration-features",
         .working_directory = full_config.@"working-directory",
-        .resources_dir = null,
+        .resources_dir = self.resources_dir,
         .term = opts.term,
 
         // TODO:cgroup management
@@ -228,6 +238,9 @@ pub fn deinit(self: *Terminal) void {
 
     self.gpa.destroy(self.mailbox);
     self.gpa.free(self.command);
+    if (self.resources_dir) |resources_dir| {
+        self.gpa.free(resources_dir);
+    }
 }
 
 pub fn widget(self: *Terminal) vxfw.Widget {
