@@ -1008,7 +1008,10 @@ fn handleSurfaceMessage(
         //
         // .present_surface => try self.presentSurface(),
         //
-        .password_input => |v| self.password_input = v,
+        .password_input => |v| {
+            self.password_input = v;
+            ctx.redraw = true;
+        },
         else => log.debug("unhandled surface message: {s}", .{@tagName(msg)}),
     }
 }
