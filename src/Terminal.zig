@@ -18,7 +18,9 @@ const Terminal = @This();
 
 const log = std.log.scoped(.terminal_widget);
 
+/// This is an empty Decl meant to satisfy libghostty
 pub const App = struct {
+    /// Libghostty requires this method
     pub fn wakeup(_: *App) void {}
 };
 
