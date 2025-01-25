@@ -103,9 +103,7 @@ const Model = struct {
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
             };
-            padding.padding = vxfw.Padding.all(4);
-            padding.padding.left = 8;
-            padding.padding.right = 8;
+            padding.padding = vxfw.Padding.all(2);
             const button_child: vxfw.SubSurface = .{
                 .origin = .{ .row = 0, .col = self.offset },
                 .surface = try padding.draw(ctx),
@@ -123,9 +121,7 @@ const Model = struct {
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
             };
-            padding.padding = vxfw.Padding.all(4);
-            padding.padding.left = 8;
-            padding.padding.right = 8;
+            padding.padding = vxfw.Padding.all(2);
 
             const button_child: vxfw.SubSurface = .{
                 .origin = .{ .row = 0, .col = self.leftOffset() },
@@ -144,9 +140,7 @@ const Model = struct {
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
             };
-            padding.padding = vxfw.Padding.all(4);
-            padding.padding.left = 8;
-            padding.padding.right = 8;
+            padding.padding = vxfw.Padding.all(2);
 
             const button_child: vxfw.SubSurface = .{
                 .origin = .{ .row = 0, .col = self.rightOffset() },
@@ -170,11 +164,11 @@ const Model = struct {
     }
 
     fn rightOffset(self: *Model) i17 {
-        return self.offset + self.win_width - 12;
+        return self.offset + self.win_width - 3;
     }
 
     fn leftOffset(self: *Model) i17 {
-        return self.offset - self.win_width + 12;
+        return self.offset - self.win_width + 3;
     }
 };
 
