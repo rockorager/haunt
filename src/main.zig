@@ -1,5 +1,4 @@
 const std = @import("std");
-const ghostty = @import("ghostty");
 const vaxis = @import("vaxis");
 
 const Terminal = @import("Terminal");

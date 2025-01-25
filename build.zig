@@ -78,7 +78,6 @@ pub fn build(b: *std.Build) !void {
         options.addImport("Terminal", terminal);
         terminal.addImport("ghostty", ghostty_mod);
         ghostty_mod.addImport("options", options);
-        exe.root_module.addImport("ghostty", ghostty_mod);
 
         const libxev = ghostty.builder.dependency("libxev", .{
             .target = target,
@@ -86,7 +85,6 @@ pub fn build(b: *std.Build) !void {
         });
         const libxev_mod = libxev.module("xev");
         terminal.addImport("xev", libxev_mod);
-        exe.root_module.addImport("xev", libxev_mod);
     }
 
     {
