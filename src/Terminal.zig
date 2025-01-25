@@ -41,6 +41,7 @@ pub const Options = struct {
         .sudo = false,
         .title = true,
     },
+    cursor_blink: bool = false,
 };
 
 const Config = struct {};
@@ -134,7 +135,11 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     );
     self.renderer_thread.setName("renderer") catch {};
 
-    const full_config: ghostty.config.Config = .{};
+    const full_config: ghostty.config.Config = .{
+        .@"shell-integration-features" = opts.shell_integration_features,
+        .@"cursor-style-blink" = opts.cursor_blink,
+        .term = opts.term,
+    };
 
     // Create our IO thread
     self.io_thread = try termio.Thread.init(gpa);
