@@ -51,6 +51,20 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    // Expose as a module
+    const terminal = b.addModule("Terminal", .{
+        .root_source_file = b.path("src/Terminal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("Terminal", terminal);
+
+    const options = b.addModule("options", .{
+        .root_source_file = b.path("src/options.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     {
         // Ghostty mod
         const ghostty = b.dependency("ghostty", .{
@@ -60,6 +74,10 @@ pub fn build(b: *std.Build) !void {
         });
 
         const ghostty_mod = ghostty.module("ghostty");
+        options.addImport("ghostty", ghostty_mod);
+        options.addImport("Terminal", terminal);
+        terminal.addImport("ghostty", ghostty_mod);
+        ghostty_mod.addImport("options", options);
         exe.root_module.addImport("ghostty", ghostty_mod);
 
         const libxev = ghostty.builder.dependency("libxev", .{
@@ -67,6 +85,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         });
         const libxev_mod = libxev.module("xev");
+        terminal.addImport("xev", libxev_mod);
         exe.root_module.addImport("xev", libxev_mod);
     }
 
@@ -77,19 +96,8 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         });
         const vaxis_mod = vaxis.module("vaxis");
+        terminal.addImport("vaxis", vaxis_mod);
 
         exe.root_module.addImport("vaxis", vaxis_mod);
     }
-
-    // {
-    //
-    //     // libxev mod
-    //     const libxev = b.dependency("libxev", .{
-    //         .target = target,
-    //         .optimize = optimize,
-    //     });
-    //     const libxev_mod = libxev.module("xev");
-    //
-    //     exe.root_module.addImport("xev", libxev_mod);
-    // }
 }

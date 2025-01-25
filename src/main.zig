@@ -2,14 +2,9 @@ const std = @import("std");
 const ghostty = @import("ghostty");
 const vaxis = @import("vaxis");
 
-const Terminal = @import("Terminal.zig");
+const Terminal = @import("Terminal");
 
 const vxfw = vaxis.vxfw;
-
-pub const ghostty_options = struct {
-    pub const Renderer = Terminal.Renderer;
-    pub const runtime = @import("Terminal.zig");
-};
 
 // Animation transition time for moving between panes
 const transition_time_ms = 100;
