@@ -640,9 +640,14 @@ fn updateScreen(self: *Terminal) !void {
     };
     defer screen.deinit();
 
+    // Create an arena allocator for hyperlink allocations
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+
     var row_iter = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row: u16 = 0;
     while (row_iter.next()) |pin| {
+        const page = &pin.node.data;
         defer row += 1;
         if (row >= self.screen.height) {
             // We can enter this branch when a resize is not complete yet
@@ -655,6 +660,8 @@ fn updateScreen(self: *Terminal) !void {
         var col: u16 = 0;
         const cells = pin.cells(.all);
         for (cells) |*cell| {
+            // Reset the arena every cell
+            _ = arena.reset(.retain_capacity);
             defer col += 1;
             if (col >= self.screen.width) {
                 // We can enter this branch when a resize is not complete yet
@@ -663,6 +670,35 @@ fn updateScreen(self: *Terminal) !void {
             if (cell.isEmpty()) {
                 self.screen.writeCell(col, row, .{});
                 continue;
+            }
+
+            var hyperlink: vaxis.Cell.Hyperlink = .{};
+            if (cell.hyperlink) {
+                // Cell has a hyperlink
+                const page_id = page.lookupHyperlink(cell) orelse unreachable;
+                const link = page.hyperlink_set.get(page.memory, page_id);
+
+                const uri = link.uri.offset.ptr(page.memory)[0..link.uri.len];
+                hyperlink.uri = try arena.allocator().dupe(u8, uri);
+                switch (link.id) {
+                    .implicit => |v| {
+                        // The id for the param is the hex encoded ptr mashed with the id
+                        hyperlink.params = try std.fmt.allocPrint(
+                            arena.allocator(),
+                            "id={x}-{d}",
+                            .{ @intFromPtr(self), v },
+                        );
+                    },
+                    .explicit => |slice| {
+                        // The id for the param is the hex encoded ptr mashed with the id
+                        const _id = slice.offset.ptr(page.memory)[0..slice.len];
+                        hyperlink.params = try std.fmt.allocPrint(
+                            arena.allocator(),
+                            "id={x}-{s}",
+                            .{ @intFromPtr(self), _id },
+                        );
+                    },
+                }
             }
             const ghostty_style = pin.style(cell);
             const vx_style: vaxis.Style = ghosttyStyleToVaxisStyle(ghostty_style, cell);
@@ -675,6 +711,7 @@ fn updateScreen(self: *Terminal) !void {
                         // Codepoints we assume are always correct for width
                         .char = .{ .grapheme = char, .width = cell.gridWidth() },
                         .style = vx_style,
+                        .link = hyperlink,
                     });
                 },
                 .codepoint_grapheme => {
@@ -702,10 +739,11 @@ fn updateScreen(self: *Terminal) !void {
                             .width = @intCast(width),
                         },
                         .style = vx_style,
+                        .link = hyperlink,
                     });
                 },
                 .bg_color_palette, .bg_color_rgb => {
-                    self.screen.writeCell(col, row, .{ .style = vx_style });
+                    self.screen.writeCell(col, row, .{ .style = vx_style, .link = hyperlink });
                 },
             }
         }
