@@ -234,7 +234,12 @@ pub const Connection = struct {
         switch (request.method) {
             .attach => |attach| {
                 const gpa = self.server.gpa;
-                self.ttyname = try gpa.dupe(u8, attach.ttyname);
+                if (self.session) |session| {
+                    session.removeConnection(self);
+                }
+                if (self.ttyname == null) {
+                    self.ttyname = try gpa.dupe(u8, attach.ttyname);
+                }
                 if (attach.session) |session_name| blk: {
                     const session = self.server.getSession(session_name) orelse
                         break :blk;
@@ -245,6 +250,7 @@ pub const Connection = struct {
                 // Create a new session
                 const session = try self.server.gpa.create(Session);
                 session.* = try Session.init(self.server, attach.session);
+                std.log.debug("creating new session: {s}", .{session.name});
                 try self.server.sessions.append(session);
                 try session.attach(self);
 
@@ -345,7 +351,8 @@ pub const Session = struct {
 
     // Generates a random session name
     fn randomName(gpa: Allocator) Allocator.Error![]const u8 {
-        var prng = std.rand.DefaultPrng.init(0);
+        const seed: u64 = @intCast(std.time.nanoTimestamp());
+        var prng = std.rand.DefaultPrng.init(seed);
         const noun_idx = prng.random().intRangeAtMost(u8, 0, nouns.len - 1);
         const adjective_idx = prng.random().intRangeAtMost(u8, 0, adjectives.len - 1);
         const noun = nouns[noun_idx];
