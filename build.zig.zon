@@ -7,8 +7,8 @@
             .hash = "12200ff4b5ac137a09a352e2921056efe5c27c1434d74ed40d81da1168e7bd2b981e",
         },
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#d34c4c6c7f73591a59ee12452828fcd4afe0c0bf",
-            .hash = "12209203c31d224d0d106b57a281a7b038554d5e4b094db5c9bf409930fd361bd665",
+            .url = "git+https://github.com/rockorager/libvaxis#38f3e7b8fef26d0747b950098933314f9e8afa3b",
+            .hash = "12200b3310585a3baa66b584e74853353cdadae9998a80a8acb6024bb998413a04af",
         },
         .iterm2_themes = .{
             .url = "https://github.com/mbadolato/iTerm2-Color-Schemes/archive/25cb3c3f52c7011cd8a599f8d144fc63f4409eb6.tar.gz",
