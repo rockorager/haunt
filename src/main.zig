@@ -197,9 +197,12 @@ pub fn main() !void {
             vt.close(null) catch {
                 vt.deinit();
             };
-            // vt.deinit();
         }
     }
 
     try app.run(model.widget(), .{});
+}
+
+test {
+    _ = @import("server.zig");
 }

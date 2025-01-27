@@ -1101,8 +1101,6 @@ fn resize(self: *Terminal, size: renderer.Size) !void {
 fn notifyResize(self: *Terminal, size: renderer.Size) !void {
     if (!self.resize_msg_sent.load(.unordered)) {
         self.resize_msg_sent.store(true, .unordered);
-        self.renderer_mutex.lock();
-        defer self.renderer_mutex.unlock();
         self.io.queueMessage(.{ .resize = size }, .unlocked);
     }
 }

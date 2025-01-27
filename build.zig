@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "haunt",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/main2.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -85,6 +85,8 @@ pub fn build(b: *std.Build) !void {
         });
         const libxev_mod = libxev.module("xev");
         terminal.addImport("xev", libxev_mod);
+        exe_unit_tests.root_module.addImport("xev", libxev_mod);
+        exe.root_module.addImport("xev", libxev_mod);
     }
 
     {
