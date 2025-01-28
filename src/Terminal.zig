@@ -96,6 +96,8 @@ title: []const u8,
 /// If the child process in the terminal has exited
 child_exited: bool = false,
 
+visible: bool = true,
+
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.gpa = gpa;
@@ -278,7 +280,7 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
             try self.drainAppMailbox(ctx);
             try self.drainRendererMailbox();
             // Set redraw if it was false
-            ctx.redraw = ctx.redraw or self.redraw.load(.unordered);
+            ctx.redraw = ctx.redraw or (self.visible and self.redraw.load(.unordered));
             try ctx.tick(8, self.widget());
         },
         .key_press, .key_release => |key| {
@@ -550,8 +552,6 @@ fn render(
 
     // Check if we should quit
     if (self.quit.load(.unordered)) return .disarm;
-
-    self.redraw.store(true, .unordered);
 
     self.updateScreen() catch |err| {
         log.err("couldn't update screen={}", .{err});
