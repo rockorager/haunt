@@ -1,9 +1,46 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const json = std.json;
+const net = std.net;
 const posix = std.posix;
 
+const protocol = @import("protocol.zig");
+
 const Allocator = std.mem.Allocator;
+
+pub const Client = struct {
+    gpa: Allocator,
+    stream: net.Stream,
+
+    pub fn init(gpa: Allocator, sockpath: []const u8) !Client {
+        return .{
+            .gpa = gpa,
+            .stream = try net.connectUnixSocket(sockpath),
+        };
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.stream.close();
+    }
+
+    pub fn attach(self: *Client) !void {
+        const tty = try ttyname(self.gpa);
+        defer self.gpa.free(tty);
+        std.log.debug("ttyname={s}", .{tty});
+
+        const msg: protocol.Request = .{
+            .id = .{ .integer = 1 },
+            .method = .{
+                .attach = .{
+                    .ttyname = tty,
+                    .session = null,
+                },
+            },
+        };
+        try msg.stringify(self.stream.writer().any());
+    }
+};
 
 /// Returns the path of this tty device (eg /dev/pts/2, /dev/ttyS0)
 fn ttyname(gpa: Allocator) ![]const u8 {

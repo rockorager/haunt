@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const net = std.net;
 const posix = std.posix;
 const protocol = @import("protocol.zig");
+const ScrollingWM = @import("scrolling.zig").Model;
 
 const Allocator = std.mem.Allocator;
 
@@ -121,6 +122,7 @@ pub const Server = struct {
             },
             .process_events_c = undefined,
             .connection_closed = false,
+            .winsize = .{ .cols = 10, .rows = 10, .x_pixel = 20, .y_pixel = 40 },
         };
 
         self.connections.append(connection) catch |err| {
@@ -196,6 +198,8 @@ pub const Connection = struct {
     // Set to true if the read thread exits unexpectedly
     connection_closed: bool,
 
+    winsize: vaxis.Winsize,
+
     const ReadError = Allocator.Error || protocol.Error;
 
     pub fn deinit(self: *Connection) void {
@@ -263,6 +267,7 @@ pub const Connection = struct {
             if (end == 0) continue;
             const raw_msg = self.queue.items[0..end];
 
+            std.log.debug("wire msg={s}", .{raw_msg});
             const request = try protocol.Request.decode(arena.allocator(), self, raw_msg);
             std.log.err("request = {}", .{request});
             try self.handleRequest(loop, request);
@@ -276,6 +281,10 @@ pub const Connection = struct {
     }
 
     fn handleAttach(self: *Connection, loop: *xev.Loop, request: protocol.Attach) !void {
+        std.log.debug(
+            "client attach request: ttyname={s}, session={?s}",
+            .{ request.ttyname, request.session },
+        );
         const gpa = self.server.gpa;
         // Remove ourselves from any existing sessions
         if (self.session) |session| {
@@ -297,6 +306,34 @@ pub const Connection = struct {
 
         // Start a thread to read from the tty
         if (self.read_thread == null) {
+
+            // Open our tty
+            const fd = try posix.open(self.ttyname.?, .{ .ACCMODE = .RDWR }, 0);
+
+            // Set the termios
+            const termios = try vaxis.Tty.makeRaw(fd);
+
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.tty = .{
+                    .fd = fd,
+                    .termios = termios,
+                };
+
+                // Initialize vaxis
+                self.vx = .{
+                    .opts = .{ .kitty_keyboard_flags = .{ .report_events = true } },
+                    .screen = .{},
+                    .screen_last = .{},
+                    .unicode = self.server.unicode,
+                };
+                // get our initial winsize
+                self.winsize = try vaxis.Tty.getWinsize(fd);
+                try self.vx.?.resize(self.server.gpa, self.tty.?.anyWriter(), self.winsize);
+                try self.vx.?.queryTerminalSend(self.tty.?.anyWriter());
+            }
+
             self.read_thread = try std.Thread.spawn(.{}, Connection.ttyThread, .{self});
         }
         if (request.session) |session_name| blk: {
@@ -309,7 +346,7 @@ pub const Connection = struct {
 
         // Create a new session
         const session = try self.server.gpa.create(Session);
-        session.* = try Session.init(self.server, request.session);
+        try session.init(self.server, request.session);
         std.log.debug("creating new session: {s}", .{session.name});
         try self.server.sessions.append(session);
         self.session = session;
@@ -319,36 +356,7 @@ pub const Connection = struct {
     }
 
     fn ttyThread(self: *Connection) !void {
-        // Open our tty
-        const fd = try posix.open(self.ttyname.?, .{ .ACCMODE = .RDWR }, 0);
-
-        // Set the termios
-        const termios = try vaxis.Tty.makeRaw(fd);
-
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.tty = .{
-                .fd = fd,
-                .termios = termios,
-            };
-
-            // Initialize vaxis
-            self.vx = .{
-                .opts = .{},
-                .screen = .{},
-                .screen_last = .{},
-                .unicode = self.server.unicode,
-            };
-        }
-
-        // get our initial winsize
-        const winsize = try vaxis.Tty.getWinsize(fd);
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            try self.events.append(.{ .winsize = winsize });
-        }
+        const tty = self.tty orelse return;
 
         var parser: vaxis.Parser = .{
             .grapheme_data = &self.server.unicode.width_data.g_data,
@@ -360,7 +368,7 @@ pub const Connection = struct {
         defer std.log.err("goodbye thread", .{});
         // read loop
         read_loop: while (true) {
-            const n = self.tty.?.read(buf[read_start..]) catch |err| {
+            const n = tty.read(buf[read_start..]) catch |err| {
                 // TODO: clean up connection when this happens
                 std.log.err("ttyThread read error: {}", .{err});
                 self.connection_closed = true;
@@ -430,6 +438,8 @@ pub const Session = struct {
     connections: std.ArrayList(*Connection),
     server: *Server,
 
+    widget: ScrollingWM,
+
     const adjectives = [_][]const u8{
         "arcane",
         "chilling",
@@ -495,17 +505,19 @@ pub const Session = struct {
         "wraith",
     };
 
-    fn init(server: *Server, maybe_name: ?[]const u8) !Session {
+    fn init(self: *Session, server: *Server, maybe_name: ?[]const u8) !void {
         const name = if (maybe_name) |n|
             try server.gpa.dupe(u8, n)
         else
             try randomName(server.gpa);
 
-        return .{
+        self.* = .{
             .name = name,
             .connections = std.ArrayList(*Connection).init(server.gpa),
             .server = server,
+            .widget = undefined,
         };
+        try self.widget.init(server.gpa);
     }
 
     fn deinit(self: *Session) void {

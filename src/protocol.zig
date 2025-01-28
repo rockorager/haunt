@@ -105,6 +105,46 @@ pub const Request = struct {
             },
         };
     }
+
+    pub fn stringify(self: Request, writer: std.io.AnyWriter) !void {
+        var buf = std.io.bufferedWriter(writer);
+        const bw = buf.writer();
+        if (self.id) |id| {
+            switch (id) {
+                .integer => |v| {
+                    try json.stringify(.{
+                        .jsonrpc = "2.0",
+                        .method = @tagName(self.method),
+                        .params = switch (self.method) {
+                            inline else => |method| method,
+                        },
+                        .id = v,
+                    }, .{}, bw);
+                },
+                .string => |v| {
+                    try json.stringify(.{
+                        .jsonrpc = "2.0",
+                        .method = @tagName(self.method),
+                        .params = switch (self.method) {
+                            inline else => |method| method,
+                        },
+                        .id = v,
+                    }, .{}, bw);
+                },
+            }
+        } else {
+            try json.stringify(.{
+                .jsonrpc = "2.0",
+                .method = @tagName(self.method),
+                .params = switch (self.method) {
+                    inline else => |method| method,
+                },
+            }, .{}, bw);
+        }
+
+        try bw.writeByte('\n');
+        try buf.flush();
+    }
 };
 
 pub const Attach = struct {
