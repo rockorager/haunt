@@ -562,6 +562,8 @@ fn render(
 }
 
 fn updateScreen(self: *Terminal) !void {
+    self.screen_mutex.lock();
+    defer self.screen_mutex.unlock();
     var screen: terminal.Screen = critical: {
         // Take the lock in the critical path
         self.renderer_mutex.lock();
@@ -593,9 +595,6 @@ fn updateScreen(self: *Terminal) !void {
             );
             return;
         }
-
-        self.screen_mutex.lock();
-        defer self.screen_mutex.unlock();
 
         var screen = try state.terminal.screen.clone(self.gpa, .{ .viewport = .{} }, null);
         errdefer screen.deinit();
