@@ -50,6 +50,10 @@ pub const Model = struct {
 
     fn typeErasedCaptureHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
+        return self.captureEvent(ctx, event);
+    }
+
+    pub fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
@@ -73,10 +77,15 @@ pub const Model = struct {
             },
             else => {},
         }
+        return self.focusedVt().handleEvent(ctx, event);
     }
 
     fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
+        return self.handleEvent(ctx, event);
+    }
+
+    pub fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
             .init => {
                 for (self.vts, 0..) |_, i| {
@@ -115,16 +124,24 @@ pub const Model = struct {
 
     fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Model = @ptrCast(@alignCast(ptr));
+        return self.draw(ctx);
+    }
+
+    pub fn draw(self: *Model, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const max_size = ctx.max.size();
         self.win_width = max_size.width;
 
         const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
+        for (&self.vts) |*vt| {
+            vt.visible = false;
+        }
 
         {
             // centered/focused child
             const border: vxfw.Border = .{
                 .child = self.focusedVt().widget(),
             };
+            self.focusedVt().visible = true;
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
             };
@@ -140,6 +157,7 @@ pub const Model = struct {
         {
             // left child
             const left = self.focused -% 1;
+            self.vts[left].visible = true;
             const border: vxfw.Border = .{
                 .child = self.vts[left].widget(),
             };
@@ -159,6 +177,7 @@ pub const Model = struct {
         {
             // right child
             const right = self.focused +% 1;
+            self.vts[right].visible = true;
             const border: vxfw.Border = .{
                 .child = self.vts[right].widget(),
             };
@@ -184,7 +203,7 @@ pub const Model = struct {
         };
     }
 
-    fn focusedVt(self: *Model) *Terminal {
+    pub fn focusedVt(self: *Model) *Terminal {
         return &self.vts[self.focused];
     }
 

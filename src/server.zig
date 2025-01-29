@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const net = std.net;
 const posix = std.posix;
 const protocol = @import("protocol.zig");
+const vxfw = vaxis.vxfw;
 const ScrollingWM = @import("scrolling.zig").Model;
 
 const Allocator = std.mem.Allocator;
@@ -22,10 +23,13 @@ pub const Server = struct {
 
     accept_c: xev.Completion,
 
-    connections: std.ArrayList(*Connection),
+    connections: std.ArrayList(*RpcConnection),
     sessions: std.ArrayList(*Session),
 
     unicode: vaxis.Unicode,
+
+    timer: xev.Timer,
+    timer_c: xev.Completion,
 
     const log = std.log.scoped(.server);
 
@@ -48,23 +52,52 @@ pub const Server = struct {
             .sockpath = path,
             .tcp = try xev.TCP.init(address),
             .accept_c = undefined,
-            .connections = std.ArrayList(*Connection).init(gpa),
+            .connections = std.ArrayList(*RpcConnection).init(gpa),
             .sessions = std.ArrayList(*Session).init(gpa),
             .unicode = try vaxis.Unicode.init(gpa),
+            .timer = try xev.Timer.init(),
+            .timer_c = undefined,
         };
 
         try self.tcp.bind(address);
         try self.tcp.listen(1);
         log.debug("server listening at {s}...", .{path});
 
+        vxfw.DrawContext.init(&self.unicode, .unicode);
+
         self.tcp.accept(loop, &self.accept_c, Server, self, Server.acceptCallback);
+        self.timer.run(loop, &self.timer_c, 8, Server, self, Server.timerCallback);
+    }
+
+    fn timerCallback(
+        maybe_self: ?*Server,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = completion; // autofix
+        _ = loop; // autofix
+        const self = maybe_self orelse unreachable;
+        result catch |err| {
+            std.log.err("timer error: {}", .{err});
+            return .rearm;
+        };
+
+        for (self.sessions.items) |session| {
+            session.checkTimers() catch |err| {
+                std.log.err("timer error: {}", .{err});
+            };
+        }
+
+        return .rearm;
     }
 
     pub fn deinit(
         self: *Server,
     ) void {
         for (self.connections.items) |connection| {
-            connection.deinit();
+            const detach = false;
+            connection.deinit(detach);
             self.gpa.destroy(connection);
         }
         for (self.sessions.items) |session| {
@@ -98,7 +131,7 @@ pub const Server = struct {
         log.debug("accepting connection fd={d}", .{conn.fd});
 
         // Heap allocate because we always want stable pointers for callbacks
-        const connection = self.gpa.create(Connection) catch |err| {
+        const connection = self.gpa.create(RpcConnection) catch |err| {
             std.log.err("error: {}", .{err});
             return .disarm;
         };
@@ -110,19 +143,8 @@ pub const Server = struct {
             .read_c = undefined,
             .queue = std.ArrayList(u8).init(self.gpa),
             .session = null,
-            .ttyname = null,
-            .tty = null,
-            .vx = null,
-            .events = std.ArrayList(vaxis.Event).init(self.gpa),
-            .read_thread = null,
-            .mutex = .{},
-            .process_events = xev.Async.init() catch |err| {
-                std.log.err("error: {}", .{err});
-                return .disarm;
-            },
-            .process_events_c = undefined,
-            .connection_closed = false,
-            .winsize = .{ .cols = 10, .rows = 10, .x_pixel = 20, .y_pixel = 40 },
+            .prefix_pressed = false,
+            .connected = std.atomic.Value(bool).init(true),
         };
 
         self.connections.append(connection) catch |err| {
@@ -134,24 +156,23 @@ pub const Server = struct {
             loop,
             &connection.read_c,
             .{ .slice = &connection.buffer },
-            Connection,
+            RpcConnection,
             connection,
-            Connection.readCallback,
+            RpcConnection.readCallback,
         );
 
         _ = completion; // autofix
         return .rearm;
     }
 
-    fn removeConnection(self: *Server, connection: *Connection) void {
+    fn removeConnection(self: *Server, connection: *const RpcConnection) void {
         for (self.connections.items, 0..) |item, i| {
             if (item == connection) {
+                std.log.debug("removing connection from server {x}", .{@intFromPtr(connection)});
                 _ = self.connections.swapRemove(i);
                 break;
             }
         }
-        connection.deinit();
-        self.gpa.destroy(connection);
     }
 
     fn getSession(self: *Server, name: []const u8) ?*Session {
@@ -161,6 +182,15 @@ pub const Server = struct {
             }
         }
         return null;
+    }
+
+    fn removeSession(self: *Server, session: *const Session) void {
+        for (self.sessions.items, 0..) |s, i| {
+            if (s == session) {
+                _ = self.sessions.swapRemove(i);
+                break;
+            }
+        }
     }
 };
 
@@ -176,54 +206,47 @@ pub fn serverIsRunningAtPath(abs_path: []const u8) bool {
     return true;
 }
 
-pub const Connection = struct {
+pub const RpcConnection = struct {
     tcp: xev.TCP,
     server: *Server,
     buffer: [4096]u8,
     read_c: xev.Completion,
     queue: std.ArrayList(u8),
 
-    session: ?*Session,
-    ttyname: ?[]const u8,
+    session: ?SessionConnection,
 
-    // Mutex guards access to tty, vx, and events
-    mutex: std.Thread.Mutex,
-    tty: ?vaxis.Tty,
-    vx: ?vaxis.Vaxis,
-    events: std.ArrayList(vaxis.Event),
-    read_thread: ?std.Thread,
-    /// Wakes up the main thread to process events
-    process_events: xev.Async,
-    process_events_c: xev.Completion,
-    // Set to true if the read thread exits unexpectedly
-    connection_closed: bool,
+    prefix_pressed: bool,
 
-    winsize: vaxis.Winsize,
+    connected: std.atomic.Value(bool),
 
     const ReadError = Allocator.Error || protocol.Error;
 
-    pub fn deinit(self: *Connection) void {
-        if (self.ttyname) |ttyname| {
-            self.server.gpa.free(ttyname);
+    pub fn deinit(self: *RpcConnection, detach: bool) void {
+        self.connected.store(false, .unordered);
+        self.server.removeConnection(self);
+        if (self.session) |*session| {
+            session.deinit(self.server.gpa, detach);
+            self.session = null;
         }
-        if (self.session) |session| {
-            session.removeConnection(self);
-        }
-        if (self.vx) |*vx| {
-            vx.screen.deinit(self.server.gpa);
-            vx.screen_last.deinit(self.server.gpa);
-        }
-        if (self.tty) |tty| {
-            tty.deinit();
-        }
-        self.process_events.deinit();
-        self.events.deinit();
         self.queue.deinit();
+        self.sendCloseMessage() catch {};
+        posix.close(self.tcp.fd);
+    }
+
+    pub fn deinitLocked(self: *RpcConnection, detach: bool) void {
+        self.connected.store(false, .unordered);
+        self.server.removeConnection(self);
+        if (self.session) |*session| {
+            session.deinitLocked(self.server.gpa, detach);
+            self.session = null;
+        }
+        self.queue.deinit();
+        self.sendCloseMessage() catch {};
         posix.close(self.tcp.fd);
     }
 
     fn readCallback(
-        maybe_self: ?*Connection,
+        maybe_self: ?*RpcConnection,
         loop: *xev.Loop,
         completion: *xev.Completion,
         tcp: xev.TCP,
@@ -236,14 +259,24 @@ pub const Connection = struct {
 
         const self = maybe_self orelse unreachable;
         const n = result catch |err| {
+            if (!self.connected.load(.unordered)) return .disarm;
             std.log.err("read error: {}", .{err});
-            const server = self.server;
             if (err == error.EOF) {
-                self.server.removeConnection(self);
-            }
-            if (server.connections.items.len == 0) {
-                // TODO: uncomment this
-                loop.stop();
+                // Set that we are disconnected
+                self.connected.store(false, .unordered);
+
+                // If we have a session, trigger a close of the tty thread
+                if (self.session) |*session| {
+                    // Queue a message to close our tty, if we need to. If we have a tty, it will
+                    // pick this up in it's read thread and deinit in process events
+                    session.queueTtyThreadClose() catch |err2| {
+                        std.log.err("close ttythread error: {}", .{err2});
+                    };
+                } else {
+
+                    // Otherwise we deinit ourself
+                    self.deinit(false);
+                }
             }
             return .disarm;
         };
@@ -254,7 +287,7 @@ pub const Connection = struct {
         return .rearm;
     }
 
-    fn handleRead(self: *Connection, loop: *xev.Loop, n: usize) !void {
+    fn handleRead(self: *RpcConnection, loop: *xev.Loop, n: usize) !void {
         var arena = std.heap.ArenaAllocator.init(self.server.gpa);
         defer arena.deinit();
 
@@ -268,113 +301,291 @@ pub const Connection = struct {
             const raw_msg = self.queue.items[0..end];
 
             std.log.debug("wire msg={s}", .{raw_msg});
-            const request = try protocol.Request.decode(arena.allocator(), self, raw_msg);
-            std.log.err("request = {}", .{request});
+            const request = try protocol.Request.decode(arena.allocator(), self.tcp.fd, raw_msg);
             try self.handleRequest(loop, request);
         }
     }
 
-    fn handleRequest(self: *Connection, loop: *xev.Loop, request: protocol.Request) !void {
+    fn handleRequest(self: *RpcConnection, loop: *xev.Loop, request: protocol.Request) !void {
         switch (request.method) {
             .attach => |attach| try self.handleAttach(loop, attach),
+            .@"list-sessions" => try self.handleListSessions(request.id.?),
+            // We should never receive an exit from a client
+            .exit => unreachable,
         }
     }
 
-    fn handleAttach(self: *Connection, loop: *xev.Loop, request: protocol.Attach) !void {
+    fn handleListSessions(self: *RpcConnection, id: protocol.Id) !void {
+        std.log.debug("client list-sessions", .{});
+        var sessions = std.json.Array.init(self.server.gpa);
+        defer sessions.deinit();
+
+        for (self.server.sessions.items) |session| {
+            try sessions.append(.{ .string = session.name });
+        }
+
+        const result: protocol.Response = .{
+            .id = id,
+            .result = .{ .array = sessions },
+        };
+
+        const file: std.fs.File = .{ .handle = self.tcp.fd };
+        try result.stringify(file.writer().any());
+    }
+
+    fn handleAttach(self: *RpcConnection, loop: *xev.Loop, request: protocol.Attach) !void {
         std.log.debug(
             "client attach request: ttyname={s}, session={?s}",
             .{ request.ttyname, request.session },
         );
         const gpa = self.server.gpa;
         // Remove ourselves from any existing sessions
-        if (self.session) |session| {
-            session.removeConnection(self);
+        if (self.session) |*session| {
+            session.deinit(self.server.gpa, false);
             self.session = null;
         }
 
-        if (self.ttyname == null) {
-            self.ttyname = try gpa.dupe(u8, request.ttyname);
-        }
-
-        self.process_events.wait(
-            loop,
-            &self.process_events_c,
-            Connection,
-            self,
-            Connection.processEvents,
-        );
-
-        // Start a thread to read from the tty
-        if (self.read_thread == null) {
-
-            // Open our tty
-            const fd = try posix.open(self.ttyname.?, .{ .ACCMODE = .RDWR }, 0);
-
-            // Set the termios
-            const termios = try vaxis.Tty.makeRaw(fd);
-
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                self.tty = .{
-                    .fd = fd,
-                    .termios = termios,
-                };
-
-                // Initialize vaxis
-                self.vx = .{
-                    .opts = .{ .kitty_keyboard_flags = .{ .report_events = true } },
-                    .screen = .{},
-                    .screen_last = .{},
-                    .unicode = self.server.unicode,
-                };
-                // get our initial winsize
-                self.winsize = try vaxis.Tty.getWinsize(fd);
-                try self.vx.?.resize(self.server.gpa, self.tty.?.anyWriter(), self.winsize);
-                try self.vx.?.queryTerminalSend(self.tty.?.anyWriter());
-            }
-
-            self.read_thread = try std.Thread.spawn(.{}, Connection.ttyThread, .{self});
-        }
-        if (request.session) |session_name| blk: {
-            // Find the session and return
-            const session = self.server.getSession(session_name) orelse
-                break :blk;
-            self.session = session;
-            return session.attach(self);
-        }
-
-        // Create a new session
-        const session = try self.server.gpa.create(Session);
-        try session.init(self.server, request.session);
-        std.log.debug("creating new session: {s}", .{session.name});
-        try self.server.sessions.append(session);
-        self.session = session;
-        try session.attach(self);
+        self.session = undefined;
+        try SessionConnection.init(&self.session.?, gpa, self, request, loop);
 
         std.log.debug("ttyname={s}", .{request.ttyname});
     }
 
-    fn ttyThread(self: *Connection) !void {
-        const tty = self.tty orelse return;
+    fn sendCloseMessage(self: *RpcConnection) !void {
+        const msg =
+            \\{"jsonrpc":"2.0","id":1,"method":"exit","params":0}
+            \\
+        ;
+        const file: std.fs.File = .{ .handle = self.tcp.fd };
+        try file.writer().writeAll(msg);
+    }
+};
+
+const SessionConnection = struct {
+    rpc_conn: *RpcConnection,
+    ttyname: []const u8,
+    session: *Session,
+    vx: vaxis.Vaxis,
+    tty: vaxis.Tty,
+    mutex: std.Thread.Mutex,
+    process_events: xev.Async,
+    process_events_c: xev.Completion,
+    winsize: vaxis.Winsize,
+    events: std.ArrayList(vaxis.Event),
+
+    read_thread: ?std.Thread,
+
+    prefix_pressed: bool,
+
+    connected: std.atomic.Value(bool),
+
+    /// Initialize an AttachedSession. This should only be called from the main thread
+    fn init(
+        self: *SessionConnection,
+        gpa: Allocator,
+        connection: *RpcConnection,
+        request: protocol.Attach,
+        loop: *xev.Loop,
+    ) !void {
+        const ttyname = try gpa.dupe(u8, request.ttyname);
+        const server = connection.server;
+        const session: *Session = blk: {
+            // Check if we requested a session
+            if (request.session) |session_name| {
+                // Find the given session
+                if (server.getSession(session_name)) |session| break :blk session;
+            }
+            // We didn't have the session, or we didn't supply a name. Either way create a new
+            // Session
+            const session = try gpa.create(Session);
+            try session.init(server, request.session);
+            break :blk session;
+        };
+
+        // Set up vaxis
+        const vx: vaxis.Vaxis = .{
+            .opts = .{ .kitty_keyboard_flags = .{ .report_events = true } },
+            .screen = .{},
+            .screen_last = .{},
+            .unicode = server.unicode,
+        };
+
+        const tty: vaxis.Tty = blk: {
+
+            // Open our tty
+            const fd = try posix.open(ttyname, .{ .ACCMODE = .RDWR }, 0);
+
+            // Set the termios
+            const termios = try vaxis.Tty.makeRaw(fd);
+            break :blk .{
+                .fd = fd,
+                .termios = termios,
+            };
+        };
+
+        const winsize: vaxis.Winsize = try vaxis.Tty.getWinsize(tty.fd);
+
+        // Initalize ourself
+        self.* = .{
+            .rpc_conn = connection,
+            .ttyname = ttyname,
+            .session = session,
+            .vx = vx,
+            .tty = tty,
+            .mutex = .{},
+            .process_events = try xev.Async.init(),
+            .process_events_c = undefined,
+            .winsize = winsize,
+            .events = std.ArrayList(vaxis.Event).init(gpa),
+            .read_thread = null,
+            .prefix_pressed = false,
+            .connected = std.atomic.Value(bool).init(true),
+        };
+
+        // Schedule the process events async waiter
+        self.process_events.wait(
+            loop,
+            &self.process_events_c,
+            SessionConnection,
+            self,
+            SessionConnection.processEvents,
+        );
+
+        // Start a thread to read from the tty
+        self.read_thread = try std.Thread.spawn(.{}, SessionConnection.ttyThread, .{self});
+
+        // Now we finish setup of vaxis. This has to happen after setting up the async waiter and
+        // the read_thread since we need our thread and async active to handle responses to these
+        // calls
+        try self.vx.resize(server.gpa, self.tty.anyWriter(), self.winsize);
+        try self.vx.queryTerminalSend(self.tty.anyWriter());
+        try self.vx.enterAltScreen(self.tty.anyWriter());
+
+        // Finally, add our connection to the session
+        try session.attach(self);
+    }
+
+    // Only call if AttachedSession is locked
+    fn deinit(self: *SessionConnection, gpa: Allocator, detach: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.deinitLocked(gpa, detach);
+    }
+
+    // Only call if AttachedSession is locked. If detach is true, the session will stay running
+    fn deinitLocked(self: *SessionConnection, gpa: Allocator, detach: bool) void {
+        self.session.removeConnection(self);
+        if (!detach) {
+            self.session.maybeDeinit();
+        }
+        gpa.free(self.ttyname);
+        self.events.deinit();
+
+        if (self.connected.load(.unordered)) {
+            self.queueTtyThreadClose() catch |err| {
+                std.log.debug("couldn't send DSR {}", .{err});
+            };
+        }
+        self.vx.resetState(self.tty.anyWriter()) catch {};
+        self.vx.screen.deinit(gpa);
+        self.vx.screen_last.deinit(gpa);
+        self.tty.deinit();
+        self.process_events.deinit();
+        if (self.read_thread) |thread| {
+            std.log.debug("joining thread", .{});
+            thread.join();
+            std.log.debug("thread joined", .{});
+            self.read_thread = null;
+        }
+    }
+
+    fn processEvents(
+        maybe_self: ?*SessionConnection,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        result: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        const self = maybe_self orelse unreachable;
+        if (!self.connected.load(.unordered)) {
+            // If we get here, it's because the client hung up.
+            self.deinit(self.session.server.gpa, false);
+            return .disarm;
+        }
+        result catch |err| {
+            std.log.err("wait error: {}", .{err});
+            return .rearm;
+        };
+
+        var run_defers: bool = true;
+        self.mutex.lock();
+        defer {
+            if (run_defers) {
+                self.mutex.unlock();
+                self.events.clearRetainingCapacity();
+            }
+        }
+        for (self.events.items) |event| {
+            switch (event) {
+                .winsize => |ws| {
+                    self.vx.resize(self.rpc_conn.server.gpa, self.tty.anyWriter(), ws) catch |err| {
+                        std.log.err("wait error: {}", .{err});
+                    };
+                    self.winsize = ws;
+                },
+                .key_press => |key| {
+                    if (self.prefix_pressed) {
+                        if (key.matches('d', .{})) {
+                            self.queueTtyThreadClose() catch |err| {
+                                std.log.err("queueTtyThreadClose error: {}", .{err});
+                            };
+                            self.rpc_conn.deinitLocked(true);
+                            run_defers = false;
+                            return .rearm;
+                        }
+                    }
+                    // self.prefix_pressed = false;
+                    if (key.matches('b', .{ .ctrl = true })) {
+                        self.prefix_pressed = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        self.session.handleEvents(self.events.items) catch |err| {
+            std.log.err("wait error: {}", .{err});
+            return .rearm;
+        };
+
+        return .rearm;
+    }
+
+    fn ttyThread(self: *SessionConnection) !void {
+        const tty = self.tty;
+        const server = self.rpc_conn.server;
 
         var parser: vaxis.Parser = .{
-            .grapheme_data = &self.server.unicode.width_data.g_data,
+            .grapheme_data = &server.unicode.width_data.g_data,
         };
 
         // initialize the read buffer
         var buf: [1024]u8 = undefined;
         var read_start: usize = 0;
-        defer std.log.err("goodbye thread", .{});
+        defer std.log.err("ttyThread exited", .{});
         // read loop
         read_loop: while (true) {
             const n = tty.read(buf[read_start..]) catch |err| {
-                // TODO: clean up connection when this happens
+                // We get to this branch if the client disconnected. In that case we need to clean
+                // up in the main thread. Set the connected state and wakeup the main thread to
+                // handle cleanup
                 std.log.err("ttyThread read error: {}", .{err});
-                self.connection_closed = true;
+                self.connected.store(false, .unordered);
                 try self.process_events.notify();
                 return;
             };
+            if (!self.connected.load(.unordered)) {
+                // We get here because we told the tty thread to close. Nothing more is needed
+                return;
+            }
 
             // Lock from here on out so we can append to the event list
             self.mutex.lock();
@@ -396,7 +607,6 @@ pub const Connection = struct {
                 seq_start += result.n;
 
                 const event = result.event orelse continue;
-                std.log.debug("{}", .{event});
                 try self.events.append(event);
             }
             if (self.events.items.len > 0) {
@@ -406,39 +616,21 @@ pub const Connection = struct {
         }
     }
 
-    fn processEvents(
-        maybe_self: ?*Connection,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        result: xev.Async.WaitError!void,
-    ) xev.CallbackAction {
-        const self = maybe_self orelse unreachable;
-        if (self.connection_closed) {
-            self.read_thread.?.join();
-            return .disarm;
-        }
-        result catch |err| {
-            std.log.err("wait error: {}", .{err});
-            return .rearm;
-        };
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        defer self.events.clearRetainingCapacity();
-        for (self.events.items) |event| {
-            std.log.debug("event processed: {}", .{event});
-        }
-
-        return .rearm;
+    fn queueTtyThreadClose(self: *SessionConnection) !void {
+        std.log.debug("queuing ttyThreadClose", .{});
+        self.connected.store(false, .unordered);
+        try self.vx.deviceStatusReport(self.tty.anyWriter());
     }
 };
 
 pub const Session = struct {
     name: []const u8,
-    connections: std.ArrayList(*Connection),
+    connections: std.ArrayList(*SessionConnection),
     server: *Server,
 
     widget: ScrollingWM,
+
+    timers: std.ArrayList(vxfw.Tick),
 
     const adjectives = [_][]const u8{
         "arcane",
@@ -513,16 +705,79 @@ pub const Session = struct {
 
         self.* = .{
             .name = name,
-            .connections = std.ArrayList(*Connection).init(server.gpa),
+            .connections = std.ArrayList(*SessionConnection).init(server.gpa),
             .server = server,
             .widget = undefined,
+            .timers = std.ArrayList(vxfw.Tick).init(server.gpa),
         };
         try self.widget.init(server.gpa);
+        var ctx: vxfw.EventContext = .{
+            .phase = .at_target,
+            .cmds = std.ArrayList(vxfw.Command).init(self.server.gpa),
+            .consume_event = false,
+            .redraw = false,
+            .quit = false,
+        };
+        defer ctx.cmds.deinit();
+        try self.widget.widget().handleEvent(&ctx, .init);
+        try self.handleCommands(&ctx.cmds);
+        try self.server.sessions.append(self);
     }
 
     fn deinit(self: *Session) void {
         self.server.gpa.free(self.name);
         self.connections.deinit();
+        self.widget.deinit();
+        self.timers.deinit();
+    }
+
+    fn checkTimers(self: *Session) !void {
+        const now_ms = std.time.milliTimestamp();
+
+        var ctx: vxfw.EventContext = .{
+            .phase = .at_target,
+            .cmds = std.ArrayList(vxfw.Command).init(self.server.gpa),
+            .consume_event = false,
+            .redraw = false,
+            .quit = false,
+        };
+        defer ctx.cmds.deinit();
+
+        // timers are always sorted descending
+        while (self.timers.popOrNull()) |tick| {
+            if (now_ms < tick.deadline_ms) {
+                // re-add the timer
+                try self.timers.append(tick);
+                break;
+            }
+            try tick.widget.handleEvent(&ctx, .tick);
+        }
+        try self.handleCommands(&ctx.cmds);
+        if (ctx.redraw)
+            try self.draw();
+    }
+
+    fn handleCommands(self: *Session, cmds: *std.ArrayList(vxfw.Command)) !void {
+        defer cmds.clearRetainingCapacity();
+        for (cmds.items) |cmd| {
+            switch (cmd) {
+                .tick => |tick| {
+                    try self.timers.append(tick);
+                    std.sort.insertion(vxfw.Tick, self.timers.items, {}, vxfw.Tick.lessThan);
+                },
+                // .set_mouse_shape => |shape| self.vx.setMouseShape(shape),
+                // .request_focus => |widget| self.wants_focus = widget,
+                // .copy_to_clipboard => |content| {
+                //     self.vx.copyToSystemClipboard(self.tty.anyWriter(), content, self.allocator) catch |err| {
+                //         switch (err) {
+                //             error.OutOfMemory => return Allocator.Error.OutOfMemory,
+                //             else => std.log.err("copy error: {}", .{err}),
+                //         }
+                //     };
+                // },
+                else => {},
+            }
+        }
     }
 
     // Generates a random session name
@@ -536,16 +791,85 @@ pub const Session = struct {
         return std.fmt.allocPrint(gpa, "{s}-{s}", .{ adjective, noun });
     }
 
-    fn attach(self: *Session, conn: *Connection) !void {
+    fn attach(self: *Session, conn: *SessionConnection) !void {
         try self.connections.append(conn);
     }
 
-    fn removeConnection(self: *Session, connection: *Connection) void {
+    fn removeConnection(self: *Session, connection: *SessionConnection) void {
         for (self.connections.items, 0..) |item, i| {
             if (item == connection) {
+                std.log.debug("removing connection from session {x}", .{@intFromPtr(connection)});
                 _ = self.connections.swapRemove(i);
-                return;
+                break;
             }
         }
     }
+
+    // Close the session if there are no connections
+    fn maybeDeinit(self: *Session) void {
+        if (self.connections.items.len == 0) {
+            std.log.debug("closing session {s}", .{self.name});
+            self.server.removeSession(self);
+            self.deinit();
+        }
+    }
+
+    fn handleEvents(self: *Session, events: []const vaxis.Event) !void {
+        var ctx: vxfw.EventContext = .{
+            .phase = .at_target,
+            .cmds = std.ArrayList(vxfw.Command).init(self.server.gpa),
+
+            .consume_event = false,
+            .redraw = false,
+            .quit = false,
+        };
+        defer ctx.cmds.deinit();
+        for (events) |vaxis_event| {
+            if (vaxis_event == .winsize) {
+                ctx.redraw = true;
+            }
+            const event = vaxisToVxfwEvent(vaxis_event) orelse continue;
+            try self.widget.captureEvent(&ctx, event);
+            try self.handleCommands(&ctx.cmds);
+        }
+        if (ctx.redraw) {
+            try self.draw();
+        }
+    }
+
+    fn draw(self: *Session) !void {
+        assert(self.connections.items.len > 0);
+        var arena = std.heap.ArenaAllocator.init(self.server.gpa);
+        defer arena.deinit();
+
+        const ctx: vxfw.DrawContext = .{
+            .arena = arena.allocator(),
+            .min = .{ .width = 0, .height = 0 },
+            .max = .{
+                .width = self.connections.items[0].winsize.cols,
+                .height = self.connections.items[0].winsize.rows,
+            },
+            .cell_size = .{ .width = 8, .height = 16 },
+        };
+        for (self.connections.items) |connection| {
+            var vx = connection.vx;
+            const tty = connection.tty;
+            const win = vx.window();
+            win.clear();
+            const surface = try self.widget.draw(ctx);
+            surface.render(vx.window(), self.widget.focusedVt().widget());
+            var buf = std.io.bufferedWriter(tty.anyWriter());
+            try vx.render(buf.writer().any());
+            try buf.flush();
+        }
+    }
 };
+
+fn vaxisToVxfwEvent(event: vaxis.Event) ?vxfw.Event {
+    switch (event) {
+        .key_press => |key| return .{ .key_press = key },
+        .key_release => |key| return .{ .key_release = key },
+        else => std.log.debug("unhandled event: {}", .{event}),
+    }
+    return null;
+}

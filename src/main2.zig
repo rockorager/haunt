@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const xev = @import("xev");
 
 const client = @import("client.zig");
+const protocol = @import("protocol.zig");
 const server = @import("server.zig");
 
 const Terminal = @import("Terminal");
@@ -18,7 +19,7 @@ pub fn main() !void {
     defer loop.deinit();
 
     // Try to connect as a client. If we error, we might start a server
-    var cl = client.Client.init(gpa.allocator(), sockpath) catch |err| blk: {
+    var cl = client.Client.init(gpa.allocator(), sockpath) catch |err| {
         switch (err) {
             error.FileNotFound => {}, // No socket found. Start the server
             error.ConnectionRefused => {
@@ -35,47 +36,88 @@ pub fn main() !void {
             },
         }
         // start the server by forking
-        const pid = try std.posix.fork();
-        if (pid == 0) {
-            // reset stdin, stdout, stderr
-            const dev_null = try std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-            try std.posix.dup2(dev_null, std.posix.STDIN_FILENO);
-            try std.posix.dup2(dev_null, std.posix.STDOUT_FILENO);
-            // try std.posix.dup2(dev_null, std.posix.STDERR_FILENO);
-            // we are the child.
-            _ = std.os.linux.setsid();
-            var srv: server.Server = undefined;
-            try srv.init(gpa.allocator(), sockpath, &loop);
+        // const pid = try std.posix.fork();
+        // if (pid == 0) {
+        // reset stdin, stdout, stderr
+        // const dev_null = try std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        // try std.posix.dup2(dev_null, std.posix.STDIN_FILENO);
+        // try std.posix.dup2(dev_null, std.posix.STDOUT_FILENO);
+        // // try std.posix.dup2(dev_null, std.posix.STDERR_FILENO);
+        // // we are the child.
+        // _ = std.os.linux.setsid();
+        var srv: server.Server = undefined;
+        try srv.init(gpa.allocator(), sockpath, &loop);
 
-            defer srv.deinit();
+        defer srv.deinit();
 
-            try loop.run(.until_done);
+        try loop.run(.until_done);
+        return;
+        // }
+        //
+        // return;
+
+        // // We are the original process. Let's sleep and try to connect again
+        // const retries: u8 = 50;
+        // var i: u8 = 0;
+        // while (i <= retries) : (i += 1) {
+        //     // Sleep m
+        //     std.time.sleep(@as(u64, i) * std.time.ns_per_ms);
+        //     if (client.Client.init(gpa.allocator(), sockpath)) |cl|
+        //         break :blk cl
+        //     else |err2| {
+        //         if (i == retries) {
+        //             std.log.err("error trying connection after fork: {}", .{err2});
+        //             return err2;
+        //         }
+        //     }
+    };
+    // return error.FailedConnection;
+
+    var args = try std.process.argsWithAllocator(gpa.allocator());
+    defer args.deinit();
+    // Skip the binary
+    _ = args.next();
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, "list-sessions", arg)) {
+            return cl.listSessions();
+        }
+        if (std.mem.eql(u8, "attach", arg)) {
+            // grab the next and attach to that session
+            const session = args.next() orelse return error.MissingArg;
+            try cl.attach(session);
+            while (true) {
+                var buf: [4096]u8 = undefined;
+                const n = try cl.stream.read(&buf);
+                if (n == 0) {
+                    break;
+                }
+                std.log.debug("{s}", .{buf[0..n]});
+                //
+            }
             return;
         }
-
-        // We are the original process. Let's sleep and try to connect again
-        const retries: u8 = 50;
-        var i: u8 = 0;
-        while (i <= retries) : (i += 1) {
-            // Sleep m
-            std.time.sleep(@as(u64, i) * std.time.ns_per_ms);
-            if (client.Client.init(gpa.allocator(), sockpath)) |cl|
-                break :blk cl
-            else |err2| {
-                if (i == retries) {
-                    std.log.err("error trying connection after fork: {}", .{err2});
-                    return err2;
-                }
-            }
-        }
-        return error.FailedConnection;
-    };
-    try cl.attach();
+    }
+    try cl.attach(null);
     while (true) {
         var buf: [4096]u8 = undefined;
         const n = try cl.stream.read(&buf);
         if (n == 0) {
             break;
+        }
+        const raw_msg = buf[0..n];
+        std.log.debug("wire msg={s}", .{raw_msg});
+        var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        defer arena.deinit();
+        // TODO:
+        const request = try protocol.Request.decode(arena.allocator(), cl.stream.handle, raw_msg);
+        switch (request.method) {
+            .exit => |v| {
+                if (v == 0) return;
+                std.log.err("error={d}", .{v});
+                return error.Bad;
+            },
+            else => {},
         }
         std.log.debug("{s}", .{buf[0..n]});
         //

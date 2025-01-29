@@ -24,7 +24,7 @@ pub const Client = struct {
         self.stream.close();
     }
 
-    pub fn attach(self: *Client) !void {
+    pub fn attach(self: *Client, session: ?[]const u8) !void {
         const tty = try ttyname(self.gpa);
         defer self.gpa.free(tty);
         std.log.debug("ttyname={s}", .{tty});
@@ -34,11 +34,35 @@ pub const Client = struct {
             .method = .{
                 .attach = .{
                     .ttyname = tty,
-                    .session = null,
+                    .session = session,
                 },
             },
         };
         try msg.stringify(self.stream.writer().any());
+    }
+
+    pub fn listSessions(self: *Client) !void {
+        const request: protocol.Request = .{
+            .id = .{ .integer = 1 },
+            .method = .@"list-sessions",
+        };
+        try request.stringify(self.stream.writer().any());
+        var buf: [4096]u8 = undefined;
+        const stdout = std.io.getStdOut().writer();
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        while (true) {
+            const msg = try self.stream.reader().readUntilDelimiter(&buf, '\n');
+            const response = try protocol.Response.decode(arena.allocator(), msg);
+            if (response.id == .integer and response.id.integer == 1) {
+                const array = response.result.array;
+                for (array.items) |item| {
+                    try stdout.writeAll(item.string);
+                    try stdout.writeAll("\n");
+                }
+                return;
+            }
+        }
     }
 };
 
