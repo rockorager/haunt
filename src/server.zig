@@ -345,7 +345,7 @@ pub const RpcConnection = struct {
             self.session = null;
         }
 
-        self.session = undefined;
+        self.session = @as(SessionConnection, undefined);
         try SessionConnection.init(&self.session.?, gpa, self, request, loop);
 
         std.log.debug("ttyname={s}", .{request.ttyname});
@@ -458,8 +458,8 @@ const SessionConnection = struct {
         // the read_thread since we need our thread and async active to handle responses to these
         // calls
         try self.vx.resize(server.gpa, self.tty.anyWriter(), self.winsize);
-        try self.vx.queryTerminalSend(self.tty.anyWriter());
         try self.vx.enterAltScreen(self.tty.anyWriter());
+        try self.vx.queryTerminalSend(self.tty.anyWriter());
 
         // Finally, add our connection to the session
         try session.attach(self);
@@ -481,14 +481,16 @@ const SessionConnection = struct {
         gpa.free(self.ttyname);
         self.events.deinit();
 
+        self.vx.resetState(self.tty.anyWriter()) catch |err| {
+            std.log.err("couldn't reset state: {}", .{err});
+        };
+        self.vx.screen.deinit(gpa);
+        self.vx.screen_last.deinit(gpa);
         if (self.connected.load(.unordered)) {
             self.queueTtyThreadClose() catch |err| {
                 std.log.debug("couldn't send DSR {}", .{err});
             };
         }
-        self.vx.resetState(self.tty.anyWriter()) catch {};
-        self.vx.screen.deinit(gpa);
-        self.vx.screen_last.deinit(gpa);
         self.tty.deinit();
         self.process_events.deinit();
         if (self.read_thread) |thread| {

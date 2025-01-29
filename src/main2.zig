@@ -78,27 +78,16 @@ pub fn main() !void {
     // Skip the binary
     _ = args.next();
 
+    var session: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, "list-sessions", arg)) {
             return cl.listSessions();
         }
         if (std.mem.eql(u8, "attach", arg)) {
-            // grab the next and attach to that session
-            const session = args.next() orelse return error.MissingArg;
-            try cl.attach(session);
-            while (true) {
-                var buf: [4096]u8 = undefined;
-                const n = try cl.stream.read(&buf);
-                if (n == 0) {
-                    break;
-                }
-                std.log.debug("{s}", .{buf[0..n]});
-                //
-            }
-            return;
+            session = args.next();
         }
     }
-    try cl.attach(null);
+    try cl.attach(session);
     while (true) {
         var buf: [4096]u8 = undefined;
         const n = try cl.stream.read(&buf);
