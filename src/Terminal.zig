@@ -118,6 +118,7 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     self.redraw = std.atomic.Value(bool).init(false);
     self.quit = std.atomic.Value(bool).init(false);
     self.resize_msg_sent = std.atomic.Value(bool).init(false);
+    self.visible = true;
 
     self.title = "";
 
@@ -562,9 +563,11 @@ fn render(
 }
 
 fn updateScreen(self: *Terminal) !void {
-    self.screen_mutex.lock();
-    defer self.screen_mutex.unlock();
-    var screen: terminal.Screen = critical: {
+    const Critical = struct {
+        screen: terminal.Screen,
+        cursor_state: ?vxfw.CursorState,
+    };
+    var critical: Critical = critical: {
         // Take the lock in the critical path
         self.renderer_mutex.lock();
         defer self.renderer_mutex.unlock();
@@ -605,6 +608,7 @@ fn updateScreen(self: *Terminal) !void {
         const cursor_pin_y = state.terminal.screen.cursor.page_pin.y;
         const cursor_row: u16 = cursor_pin_y -| top_left.y;
 
+        var crit: Critical = .{ .screen = screen, .cursor_state = null };
         // Set our cursor visible state while we have the lock
         if (state.terminal.modes.get(.cursor_visible) and cursor_row < grid.rows) {
             const blink = state.terminal.modes.get(.cursor_blinking);
@@ -613,13 +617,11 @@ fn updateScreen(self: *Terminal) !void {
                 .block, .block_hollow => if (blink) .block_blink else .block,
                 .underline => if (blink) .underline_blink else .underline,
             };
-            self.cursor_state = .{
+            crit.cursor_state = .{
                 .col = screen.cursor.x,
                 .row = screen.cursor.y,
                 .shape = shape,
             };
-        } else {
-            self.cursor_state = null;
         }
 
         // Reset the dirty flags in the terminal and screen. We assume
@@ -640,9 +642,16 @@ fn updateScreen(self: *Terminal) !void {
             }
         }
 
-        break :critical screen;
+        break :critical crit;
     };
-    defer screen.deinit();
+    defer critical.screen.deinit();
+
+    self.screen_mutex.lock();
+    defer self.screen_mutex.unlock();
+
+    self.cursor_state = critical.cursor_state;
+
+    const screen = critical.screen;
 
     // Create an arena allocator for hyperlink allocations
     var arena = std.heap.ArenaAllocator.init(self.gpa);
