@@ -26,6 +26,12 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    const exe_check = b.addExecutable(.{
+        .name = "haunt",
+        .root_source_file = b.path("src/main2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     b.installArtifact(exe);
 
@@ -58,6 +64,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     exe.root_module.addImport("Terminal", terminal);
+    exe_check.root_module.addImport("Terminal", terminal);
 
     const options = b.addModule("options", .{
         .root_source_file = b.path("src/options.zig"),
@@ -87,6 +94,7 @@ pub fn build(b: *std.Build) !void {
         terminal.addImport("xev", libxev_mod);
         exe_unit_tests.root_module.addImport("xev", libxev_mod);
         exe.root_module.addImport("xev", libxev_mod);
+        exe_check.root_module.addImport("xev", libxev_mod);
     }
 
     {
@@ -99,6 +107,11 @@ pub fn build(b: *std.Build) !void {
         terminal.addImport("vaxis", vaxis_mod);
 
         exe.root_module.addImport("vaxis", vaxis_mod);
+        exe_check.root_module.addImport("vaxis", vaxis_mod);
         exe_unit_tests.root_module.addImport("vaxis", vaxis_mod);
     }
+
+    // Check step for better LSP support
+    const check = b.step("check", "Check if haunt compiles");
+    check.dependOn(&exe_check.step);
 }

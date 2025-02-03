@@ -7,6 +7,7 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const vxfw = vaxis.vxfw;
 const ScrollingWM = @import("scrolling.zig").Model;
+const TilingWM = @import("tiling/tiling.zig").Model;
 
 const Allocator = std.mem.Allocator;
 
@@ -459,6 +460,7 @@ const SessionConnection = struct {
         // calls
         try self.vx.resize(server.gpa, self.tty.anyWriter(), self.winsize);
         try self.vx.enterAltScreen(self.tty.anyWriter());
+        try self.vx.setMouseMode(self.tty.anyWriter(), true);
         try self.vx.queryTerminalSend(self.tty.anyWriter());
 
         // Finally, add our connection to the session
@@ -526,6 +528,8 @@ const SessionConnection = struct {
                 self.events.clearRetainingCapacity();
             }
         }
+
+        var send_to_session: bool = false;
         for (self.events.items) |event| {
             switch (event) {
                 .winsize => |ws| {
@@ -535,6 +539,7 @@ const SessionConnection = struct {
                     self.winsize = ws;
                 },
                 .key_press => |key| {
+                    send_to_session = true;
                     if (self.prefix_pressed) {
                         if (key.matches('d', .{})) {
                             self.queueTtyThreadClose() catch |err| {
@@ -550,7 +555,45 @@ const SessionConnection = struct {
                         self.prefix_pressed = true;
                     }
                 },
-                else => {},
+                .cap_kitty_keyboard => {
+                    std.log.info("kitty keyboard capability detected", .{});
+                    self.vx.caps.kitty_keyboard = true;
+                },
+                .cap_kitty_graphics => {
+                    if (!self.vx.caps.kitty_graphics) {
+                        std.log.info("kitty graphics capability detected", .{});
+                        self.vx.caps.kitty_graphics = true;
+                    }
+                },
+                .cap_rgb => {
+                    std.log.info("rgb capability detected", .{});
+                    self.vx.caps.rgb = true;
+                },
+                .cap_unicode => {
+                    std.log.info("unicode capability detected", .{});
+                    self.vx.caps.unicode = .unicode;
+                    self.vx.screen.width_method = .unicode;
+                },
+                .cap_sgr_pixels => {
+                    std.log.info("pixel mouse capability detected", .{});
+                    self.vx.caps.sgr_pixels = true;
+                },
+                .cap_color_scheme_updates => {
+                    std.log.info("color_scheme_updates capability detected", .{});
+                    self.vx.caps.color_scheme_updates = true;
+                },
+                .cap_da1 => {
+                    var buf_writer = std.io.bufferedWriter(self.tty.anyWriter());
+                    self.vx.enableDetectedFeatures(buf_writer.writer().any()) catch |err| {
+                        std.log.err("write error: {}", .{err});
+                        return .rearm;
+                    };
+                    buf_writer.flush() catch |err| {
+                        std.log.err("flush error: {}", .{err});
+                        return .rearm;
+                    };
+                },
+                else => send_to_session = true,
             }
         }
         self.session.handleEvents(self.events.items) catch |err| {
@@ -630,7 +673,11 @@ pub const Session = struct {
     connections: std.ArrayList(*SessionConnection),
     server: *Server,
 
-    widget: ScrollingWM,
+    widget: TilingWM,
+    focus_handler: FocusHandler,
+    mouse_handler: MouseHandler,
+    wants_focus: ?vxfw.Widget,
+    frame_arena: std.heap.ArenaAllocator,
 
     timers: std.ArrayList(vxfw.Tick),
 
@@ -711,8 +758,19 @@ pub const Session = struct {
             .server = server,
             .widget = undefined,
             .timers = std.ArrayList(vxfw.Tick).init(server.gpa),
+            .focus_handler = undefined,
+            .wants_focus = null,
+            .mouse_handler = undefined,
+            .frame_arena = std.heap.ArenaAllocator.init(server.gpa),
         };
+        // Initialize the widget first
         try self.widget.init(server.gpa);
+
+        // Now we have a stable widget, initialize event handlers
+        self.focus_handler.init(server.gpa, self.widget.widget());
+        try self.focus_handler.path_to_focused.append(self.widget.widget());
+        self.mouse_handler = MouseHandler.init(self.widget.widget());
+
         var ctx: vxfw.EventContext = .{
             .phase = .at_target,
             .cmds = std.ArrayList(vxfw.Command).init(self.server.gpa),
@@ -727,10 +785,13 @@ pub const Session = struct {
     }
 
     fn deinit(self: *Session) void {
+        self.focus_handler.deinit();
+        self.mouse_handler.deinit(self.server.gpa);
         self.server.gpa.free(self.name);
         self.connections.deinit();
         self.widget.deinit();
         self.timers.deinit();
+        self.frame_arena.deinit();
     }
 
     fn checkTimers(self: *Session) !void {
@@ -767,8 +828,13 @@ pub const Session = struct {
                     try self.timers.append(tick);
                     std.sort.insertion(vxfw.Tick, self.timers.items, {}, vxfw.Tick.lessThan);
                 },
-                // .set_mouse_shape => |shape| self.vx.setMouseShape(shape),
-                // .request_focus => |widget| self.wants_focus = widget,
+                .set_mouse_shape => |shape| {
+                    std.log.debug("setting mouse shape to {s}", .{@tagName(shape)});
+                    for (self.connections.items) |conn| {
+                        conn.vx.setMouseShape(shape);
+                    }
+                },
+                .request_focus => |widget| self.wants_focus = widget,
                 // .copy_to_clipboard => |content| {
                 //     self.vx.copyToSystemClipboard(self.tty.anyWriter(), content, self.allocator) catch |err| {
                 //         switch (err) {
@@ -831,8 +897,17 @@ pub const Session = struct {
                 ctx.redraw = true;
             }
             const event = vaxisToVxfwEvent(vaxis_event) orelse continue;
-            try self.widget.captureEvent(&ctx, event);
+            if (event == .mouse) {
+                try self.mouse_handler.handleMouse(self, &ctx, event.mouse);
+            } else {
+                try self.focus_handler.handleEvent(&ctx, event);
+            }
             try self.handleCommands(&ctx.cmds);
+        }
+        if (self.wants_focus) |focus| {
+            try self.focus_handler.focusWidget(&ctx, focus);
+            try self.handleCommands(&ctx.cmds);
+            self.wants_focus = null;
         }
         if (ctx.redraw) {
             try self.draw();
@@ -841,8 +916,9 @@ pub const Session = struct {
 
     fn draw(self: *Session) !void {
         assert(self.connections.items.len > 0);
-        var arena = std.heap.ArenaAllocator.init(self.server.gpa);
-        defer arena.deinit();
+        // We let each session keep up to 5mb allocated.
+        _ = self.frame_arena.reset(.{ .retain_with_limit = 5_000_000 });
+        const arena = &self.frame_arena;
 
         const ctx: vxfw.DrawContext = .{
             .arena = arena.allocator(),
@@ -854,15 +930,20 @@ pub const Session = struct {
             .cell_size = .{ .width = 8, .height = 16 },
         };
         for (self.connections.items) |connection| {
-            var vx = connection.vx;
+            const vx = &connection.vx;
             const tty = connection.tty;
             const win = vx.window();
             win.clear();
+            win.setCursorShape(.default);
             const surface = try self.widget.draw(ctx);
             surface.render(vx.window(), self.widget.focusedVt().widget());
+
             var buf = std.io.bufferedWriter(tty.anyWriter());
             try vx.render(buf.writer().any());
             try buf.flush();
+
+            try self.focus_handler.update(surface);
+            self.mouse_handler.last_frame = surface;
         }
     }
 };
@@ -871,7 +952,407 @@ fn vaxisToVxfwEvent(event: vaxis.Event) ?vxfw.Event {
     switch (event) {
         .key_press => |key| return .{ .key_press = key },
         .key_release => |key| return .{ .key_release = key },
+        .mouse => |mouse| return .{ .mouse = mouse },
         else => std.log.debug("unhandled event: {}", .{event}),
     }
     return null;
 }
+
+/// Maintains a tree of focusable nodes. Delivers events to the currently focused node, walking up
+/// the tree until the event is handled
+const FocusHandler = struct {
+    arena: std.heap.ArenaAllocator,
+
+    root: Node,
+    focused: *Node,
+    focused_widget: vxfw.Widget,
+    path_to_focused: std.ArrayList(vxfw.Widget),
+
+    const Node = struct {
+        widget: vxfw.Widget,
+        parent: ?*Node,
+        children: []*Node,
+
+        fn nextSibling(self: Node) ?*Node {
+            const parent = self.parent orelse return null;
+            const idx = for (0..parent.children.len) |i| {
+                const node = parent.children[i];
+                if (self.widget.eql(node.widget))
+                    break i;
+            } else unreachable;
+
+            // Return null if last child
+            if (idx == parent.children.len - 1)
+                return null
+            else
+                return parent.children[idx + 1];
+        }
+
+        fn prevSibling(self: Node) ?*Node {
+            const parent = self.parent orelse return null;
+            const idx = for (0..parent.children.len) |i| {
+                const node = parent.children[i];
+                if (self.widget.eql(node.widget))
+                    break i;
+            } else unreachable;
+
+            // Return null if first child
+            if (idx == 0)
+                return null
+            else
+                return parent.children[idx - 1];
+        }
+
+        fn lastChild(self: Node) ?*Node {
+            if (self.children.len > 0)
+                return self.children[self.children.len - 1]
+            else
+                return null;
+        }
+
+        fn firstChild(self: Node) ?*Node {
+            if (self.children.len > 0)
+                return self.children[0]
+            else
+                return null;
+        }
+
+        /// returns the next logical node in the tree
+        fn nextNode(self: *Node) *Node {
+            // If we have a sibling, we return it's first descendant line
+            if (self.nextSibling()) |sibling| {
+                var node = sibling;
+                while (node.firstChild()) |child| {
+                    node = child;
+                }
+                return node;
+            }
+
+            // If we don't have a sibling, we return our parent
+            if (self.parent) |parent| return parent;
+
+            // If we don't have a parent, we are the root and we return or first descendant
+            var node = self;
+            while (node.firstChild()) |child| {
+                node = child;
+            }
+            return node;
+        }
+
+        fn prevNode(self: *Node) *Node {
+            // If we have children, we return the last child descendant
+            if (self.children.len > 0) {
+                var node = self;
+                while (node.lastChild()) |child| {
+                    node = child;
+                }
+                return node;
+            }
+
+            // If we have siblings, we return the last descendant line of the sibling
+            if (self.prevSibling()) |sibling| {
+                var node = sibling;
+                while (node.lastChild()) |child| {
+                    node = child;
+                }
+                return node;
+            }
+
+            // If we don't have a sibling, we return our parent
+            if (self.parent) |parent| return parent;
+
+            // If we don't have a parent, we are the root and we return our last descendant
+            var node = self;
+            while (node.lastChild()) |child| {
+                node = child;
+            }
+            return node;
+        }
+    };
+
+    fn init(self: *FocusHandler, allocator: Allocator, root: vxfw.Widget) void {
+        self.* = .{
+            .root = .{
+                .widget = root,
+                .parent = null,
+                .children = &.{},
+            },
+            .focused = &self.root,
+            .focused_widget = root,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .path_to_focused = std.ArrayList(vxfw.Widget).init(allocator),
+        };
+    }
+
+    fn deinit(self: *FocusHandler) void {
+        self.path_to_focused.deinit();
+        self.arena.deinit();
+    }
+
+    /// Update the focus list
+    fn update(self: *FocusHandler, root: vxfw.Surface) Allocator.Error!void {
+        _ = self.arena.reset(.retain_capacity);
+
+        var list = std.ArrayList(*Node).init(self.arena.allocator());
+        for (root.children) |child| {
+            try self.findFocusableChildren(&self.root, &list, child.surface);
+        }
+
+        // Update children
+        self.root.children = list.items;
+
+        // Update path
+        self.path_to_focused.clearAndFree();
+        if (!self.root.widget.eql(root.widget)) {
+            // Always make sure the root widget (the one we started with) is the first item, even if
+            // it isn't focusable or in the path
+            try self.path_to_focused.append(self.root.widget);
+        }
+        _ = try childHasFocus(root, &self.path_to_focused, self.focused.widget);
+
+        // reverse path_to_focused so that it is root first
+        std.mem.reverse(vxfw.Widget, self.path_to_focused.items);
+    }
+
+    /// Returns true if a child of surface is the focused widget
+    fn childHasFocus(
+        surface: vxfw.Surface,
+        list: *std.ArrayList(vxfw.Widget),
+        focused: vxfw.Widget,
+    ) Allocator.Error!bool {
+        // Check if we are the focused widget
+        if (focused.eql(surface.widget)) {
+            try list.append(surface.widget);
+            return true;
+        }
+        for (surface.children) |child| {
+            // Add child to list if it is the focused widget or one of it's own children is
+            if (try childHasFocus(child.surface, list, focused)) {
+                try list.append(surface.widget);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Walks the surface tree, adding all focusable nodes to list
+    fn findFocusableChildren(
+        self: *FocusHandler,
+        parent: *Node,
+        list: *std.ArrayList(*Node),
+        surface: vxfw.Surface,
+    ) Allocator.Error!void {
+        if (self.root.widget.eql(surface.widget)) {
+            // Never add the root_widget. We will always have this as the root
+            for (surface.children) |child| {
+                try self.findFocusableChildren(parent, list, child.surface);
+            }
+        } else if (surface.focusable) {
+            // We are a focusable child of parent. Create a new node, and find our own focusable
+            // children
+            const node = try self.arena.allocator().create(Node);
+            var child_list = std.ArrayList(*Node).init(self.arena.allocator());
+            for (surface.children) |child| {
+                try self.findFocusableChildren(node, &child_list, child.surface);
+            }
+            node.* = .{
+                .widget = surface.widget,
+                .parent = parent,
+                .children = child_list.items,
+            };
+            if (self.focused_widget.eql(surface.widget)) {
+                self.focused = node;
+            }
+            try list.append(node);
+        } else {
+            for (surface.children) |child| {
+                try self.findFocusableChildren(parent, list, child.surface);
+            }
+        }
+    }
+
+    fn focusWidget(self: *FocusHandler, ctx: *vxfw.EventContext, widget: vxfw.Widget) anyerror!void {
+        if (self.focused_widget.eql(widget)) return;
+
+        ctx.phase = .at_target;
+        try self.focused_widget.handleEvent(ctx, .focus_out);
+        self.focused_widget = widget;
+        try self.focused_widget.handleEvent(ctx, .focus_in);
+    }
+
+    fn focusNode(self: *FocusHandler, ctx: *vxfw.EventContext, node: *Node) anyerror!void {
+        if (self.focused.widget.eql(node.widget)) return;
+
+        try self.focused.widget.handleEvent(ctx, .focus_out);
+        self.focused = node;
+        try self.focused.widget.handleEvent(ctx, .focus_in);
+    }
+
+    /// Focuses the next focusable widget
+    fn focusNext(self: *FocusHandler, ctx: *vxfw.EventContext) anyerror!void {
+        return self.focusNode(ctx, self.focused.nextNode());
+    }
+
+    /// Focuses the previous focusable widget
+    fn focusPrev(self: *FocusHandler, ctx: *vxfw.EventContext) anyerror!void {
+        return self.focusNode(ctx, self.focused.prevNode());
+    }
+
+    fn handleEvent(self: *FocusHandler, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+        const path = self.path_to_focused.items;
+        if (path.len == 0) return;
+
+        const target_idx = path.len - 1;
+
+        // Capturing phase
+        ctx.phase = .capturing;
+        for (path[0..target_idx]) |widget| {
+            try widget.captureEvent(ctx, event);
+            if (ctx.consume_event) return;
+        }
+
+        // Target phase
+        ctx.phase = .at_target;
+        const target = path[target_idx];
+        try target.handleEvent(ctx, event);
+        if (ctx.consume_event) return;
+
+        // Bubbling phase
+        ctx.phase = .bubbling;
+        var iter = std.mem.reverseIterator(path[0..target_idx]);
+        while (iter.next()) |widget| {
+            try widget.handleEvent(ctx, event);
+            if (ctx.consume_event) return;
+        }
+    }
+};
+
+const MouseHandler = struct {
+    last_frame: vxfw.Surface,
+    last_hit_list: []vxfw.HitResult,
+
+    fn init(root: vxfw.Widget) MouseHandler {
+        return .{
+            .last_frame = .{
+                .size = .{ .width = 0, .height = 0 },
+                .widget = root,
+                .buffer = &.{},
+                .children = &.{},
+            },
+            .last_hit_list = &.{},
+        };
+    }
+
+    fn deinit(self: MouseHandler, gpa: Allocator) void {
+        gpa.free(self.last_hit_list);
+    }
+
+    fn handleMouse(self: *MouseHandler, session: *Session, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) anyerror!void {
+        // For mouse events we store the last frame and use that for hit testing
+        const last_frame = self.last_frame;
+
+        const gpa = session.server.gpa;
+
+        var hits = std.ArrayList(vxfw.HitResult).init(gpa);
+        defer hits.deinit();
+        const sub: vxfw.SubSurface = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = last_frame,
+            .z_index = 0,
+        };
+        const mouse_point: vxfw.Point = .{
+            .row = @intCast(mouse.row),
+            .col = @intCast(mouse.col),
+        };
+        if (sub.containsPoint(mouse_point)) {
+            try last_frame.hitTest(&hits, mouse_point);
+        }
+
+        // Handle mouse_enter and mouse_leave events
+        {
+            // We store the hit list from the last mouse event to determine mouse_enter and mouse_leave
+            // events. If list a is the previous hit list, and list b is the current hit list:
+            // - Widgets in a but not in b get a mouse_leave event
+            // - Widgets in b but not in a get a mouse_enter event
+            // - Widgets in both receive nothing
+            const a = self.last_hit_list;
+            const b = hits.items;
+
+            // Find widgets in a but not b
+            for (a) |a_item| {
+                const a_widget = a_item.widget;
+                for (b) |b_item| {
+                    const b_widget = b_item.widget;
+                    if (a_widget.eql(b_widget)) break;
+                } else {
+                    // a_item is not in b
+                    try a_widget.handleEvent(ctx, .mouse_leave);
+                    try session.handleCommands(&ctx.cmds);
+                }
+            }
+
+            // Widgets in b but not in a
+            for (b) |b_item| {
+                const b_widget = b_item.widget;
+                for (a) |a_item| {
+                    const a_widget = a_item.widget;
+                    if (b_widget.eql(a_widget)) break;
+                } else {
+                    // b_item is not in a.
+                    try b_widget.handleEvent(ctx, .mouse_enter);
+                    try session.handleCommands(&ctx.cmds);
+                }
+            }
+
+            // Store a copy of this hit list for next frame
+            gpa.free(self.last_hit_list);
+            self.last_hit_list = try gpa.dupe(vxfw.HitResult, hits.items);
+        }
+
+        const target = hits.popOrNull() orelse return;
+
+        // capturing phase
+        ctx.phase = .capturing;
+        for (hits.items) |item| {
+            var m_local = mouse;
+            m_local.col = item.local.col;
+            m_local.row = item.local.row;
+            try item.widget.captureEvent(ctx, .{ .mouse = m_local });
+            try session.handleCommands(&ctx.cmds);
+
+            if (ctx.consume_event) return;
+        }
+
+        // target phase
+        ctx.phase = .at_target;
+        {
+            var m_local = mouse;
+            m_local.col = target.local.col;
+            m_local.row = target.local.row;
+            try target.widget.handleEvent(ctx, .{ .mouse = m_local });
+            try session.handleCommands(&ctx.cmds);
+
+            if (ctx.consume_event) return;
+        }
+
+        // Bubbling phase
+        ctx.phase = .bubbling;
+        while (hits.popOrNull()) |item| {
+            var m_local = mouse;
+            m_local.col = item.local.col;
+            m_local.row = item.local.row;
+            try item.widget.handleEvent(ctx, .{ .mouse = m_local });
+            try session.handleCommands(&ctx.cmds);
+
+            if (ctx.consume_event) return;
+        }
+    }
+
+    /// sends .mouse_leave to all of the widgets from the last_hit_list
+    fn mouseExit(self: *MouseHandler, session: *Session, ctx: *vxfw.EventContext) anyerror!void {
+        for (self.last_hit_list) |item| {
+            try item.widget.handleEvent(ctx, .mouse_leave);
+            try session.handleCommand(&ctx.cmds);
+        }
+    }
+};

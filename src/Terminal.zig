@@ -100,33 +100,49 @@ visible: bool = true,
 
 /// Intrusive init. We need a stable pointer for much of our init process
 pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
-    self.gpa = gpa;
-    self.size = .{
-        .screen = .{ .height = opts.size.y_pixel, .width = opts.size.x_pixel },
-        .cell = .{
-            .height = opts.size.y_pixel / opts.size.rows,
-            .width = opts.size.x_pixel / opts.size.cols,
+    self.* = .{
+        .gpa = gpa,
+        .size = .{
+            .screen = .{ .height = opts.size.y_pixel, .width = opts.size.x_pixel },
+            .cell = .{
+                .height = opts.size.y_pixel / opts.size.rows,
+                .width = opts.size.x_pixel / opts.size.cols,
+            },
+            .padding = .{},
         },
-        .padding = .{},
+        .mailbox = try ghostty.App.Mailbox.Queue.create(gpa),
+        .app = .{},
+        .screen_mutex = .{},
+        .screen = try vaxis.AllocatingScreen.init(gpa, opts.size.cols, opts.size.rows),
+        .redraw = std.atomic.Value(bool).init(false),
+        .quit = std.atomic.Value(bool).init(false),
+        .resize_msg_sent = std.atomic.Value(bool).init(false),
+        .visible = true,
+        .title = "",
+        .password_input = false,
+        .child_exited = false,
+
+        .loop = try xev.Loop.init(.{}),
+        .wakeup = try xev.Async.init(),
+        // Dupe the command if we have one so we can free it without tracking the allocation
+        .command = if (opts.command) |cmd| try gpa.dupe(u8, cmd) else try getShell(gpa),
+        .renderer_mutex = .{},
+        .resources_dir = try ghostty.os.resourcesDir(gpa),
+
+        .renderer_state = .{
+            .mutex = &self.renderer_mutex,
+            .terminal = &self.io.terminal,
+        },
+        .renderer_mailbox = try renderer.Thread.Mailbox.create(gpa),
+
+        .core_surface = undefined,
+        .renderer_thread = undefined,
+        .io = undefined,
+        .io_thread = undefined,
+        .io_thr = undefined,
     };
-    self.mailbox = try ghostty.App.Mailbox.Queue.create(gpa);
-    self.app = .{};
-    self.screen_mutex = .{};
 
-    self.screen = try vaxis.AllocatingScreen.init(gpa, opts.size.cols, opts.size.rows);
-
-    self.redraw = std.atomic.Value(bool).init(false);
-    self.quit = std.atomic.Value(bool).init(false);
-    self.resize_msg_sent = std.atomic.Value(bool).init(false);
-    self.visible = true;
-
-    self.title = "";
-
-    // Create our event loop.
-    self.loop = try xev.Loop.init(.{});
     errdefer self.loop.deinit();
-
-    self.wakeup = try xev.Async.init();
     errdefer self.wakeup.deinit();
 
     self.wakeup.wait(&self.loop, &self.wakeup_c, Terminal, self, render);
@@ -147,21 +163,6 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     // Create our IO thread
     self.io_thread = try termio.Thread.init(gpa);
     errdefer self.io_thread.deinit();
-
-    // Create our mutex and assign it into the renderer_state
-    self.renderer_mutex = .{};
-    self.renderer_state = .{
-        .mutex = &self.renderer_mutex,
-        .terminal = &self.io.terminal,
-    };
-
-    self.command = if (opts.command) |cmd|
-        // Dupe it so we don't have to track whether we allocated from shell or not
-        try gpa.dupe(u8, cmd)
-    else
-        try getShell(gpa);
-
-    self.resources_dir = try ghostty.os.resourcesDir(gpa);
 
     // initialize our IO backend
     var io_exec = try termio.Exec.init(gpa, .{
@@ -184,8 +185,6 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     var io_mailbox = try termio.Mailbox.initSPSC(gpa);
     errdefer io_mailbox.deinit(gpa);
 
-    // The mailbox for messaging the renderer
-    self.renderer_mailbox = try renderer.Thread.Mailbox.create(gpa);
     errdefer self.renderer_mailbox.destroy(gpa);
 
     const app_mailbox: ghostty.App.Mailbox = .{
@@ -338,7 +337,7 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
             .padding = .{},
         };
         try self.notifyResize(size);
-        return surface;
+        // return surface;
     }
 
     var row: u16 = 0;
@@ -354,6 +353,7 @@ pub fn draw(self: *Terminal, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface
             surface.writeCell(col, row, cell);
         }
     }
+
     switch (self.password_input) {
         true => if (self.cursor_state) |state| {
             surface.writeCell(state.col, state.row, .{ .char = .{ .grapheme = "" } });

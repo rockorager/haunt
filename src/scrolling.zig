@@ -11,32 +11,31 @@ const vxfw = vaxis.vxfw;
 const transition_time_ms = 100;
 
 pub const Model = struct {
-    vts: [4]Terminal,
+    gpa: Allocator,
+    vts: std.ArrayList(*Terminal),
     focused: u2 = 0,
     offset: i17 = 0,
     win_width: u16 = 0,
 
     pub fn init(self: *Model, gpa: Allocator) !void {
         self.* = .{
+            .gpa = gpa,
             .focused = 0,
             .offset = 0,
-            .vts = undefined,
+            .vts = std.ArrayList(*Terminal).init(gpa),
             .win_width = 0,
         };
 
-        for (self.vts, 0..) |_, i| {
-            const vt = &self.vts[i];
-            try vt.init(gpa, .{});
-        }
+        try self.newTerminal();
     }
 
     pub fn deinit(self: *Model) void {
-        for (self.vts, 0..) |_, i| {
-            const vt = &self.vts[i];
+        for (self.vts.items) |vt| {
             vt.close(null) catch {
                 vt.deinit();
             };
         }
+        self.vts.deinit();
     }
 
     pub fn widget(self: *Model) vxfw.Widget {
@@ -54,6 +53,7 @@ pub const Model = struct {
     }
 
     pub fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+        if (self.vts.items.len == 0) return;
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
@@ -61,14 +61,16 @@ pub const Model = struct {
                     return ctx.consumeEvent();
                 }
                 if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
-                    self.focused +%= 1;
+                    if (self.focused == self.vts.items.len - 1) return;
+                    self.focused += 1;
                     ctx.consumeEvent();
                     self.offset = self.rightOffset();
                     try ctx.tick(8, self.widget());
                     return ctx.requestFocus(self.focusedVt().widget());
                 }
                 if (key.matches(vaxis.Key.left, .{ .ctrl = true })) {
-                    self.focused -%= 1;
+                    if (self.focused == 0) return;
+                    self.focused -= 1;
                     ctx.consumeEvent();
                     self.offset = self.leftOffset();
                     try ctx.tick(8, self.widget());
@@ -88,8 +90,7 @@ pub const Model = struct {
     pub fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
             .init => {
-                for (self.vts, 0..) |_, i| {
-                    const vt = &self.vts[i];
+                for (self.vts.items) |vt| {
                     try vt.handleEvent(ctx, event);
                 }
                 ctx.redraw = true;
@@ -103,6 +104,7 @@ pub const Model = struct {
             },
             .focus_in => return ctx.requestFocus(self.focusedVt().widget()),
             .tick => {
+                if (self.vts.items.len == 0) return;
                 if (self.offset < 0) {
                     const speed_cells_per_ms: i17 = @max(1, self.win_width / transition_time_ms);
                     self.offset += speed_cells_per_ms * 8;
@@ -131,10 +133,42 @@ pub const Model = struct {
         const max_size = ctx.max.size();
         self.win_width = max_size.width;
 
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
-        for (&self.vts) |*vt| {
+        // {
+        //     var i: usize = 0;
+        //     while (i < self.vts.items.len) {
+        //         const vt = self.vts.items[i];
+        //         if (vt.child_exited) {
+        //             // Child exited so we need to clean it up
+        //             _ = self.vts.orderedRemove(i);
+        //             vt.deinit();
+        //             continue;
+        //         }
+        //         i += 1;
+        //     }
+        // }
+
+        if (self.vts.items.len == 0) {
+            // TODO: set should_quit
+            return .{
+                .size = max_size,
+                .widget = self.widget(),
+                .focusable = false,
+                .buffer = &.{},
+                .children = &.{},
+            };
+        }
+
+        var children = std.ArrayList(vxfw.SubSurface).init(ctx.arena);
+
+        for (self.vts.items) |vt| {
             vt.visible = false;
         }
+
+        const maybe_left: ?usize = if (self.focused == 0) null else self.focused - 1;
+        const maybe_right: ?usize = if (self.focused < self.vts.items.len -| 1)
+            self.focused + 1
+        else
+            null;
 
         {
             // centered/focused child
@@ -151,15 +185,15 @@ pub const Model = struct {
                 .surface = try padding.draw(ctx),
             };
 
-            children[0] = button_child;
+            try children.append(button_child);
         }
 
-        {
+        if (maybe_left) |left| {
             // left child
-            const left = self.focused -% 1;
-            self.vts[left].visible = true;
+            const vt = self.vts.items[left];
+            vt.visible = true;
             const border: vxfw.Border = .{
-                .child = self.vts[left].widget(),
+                .child = vt.widget(),
             };
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
@@ -171,15 +205,15 @@ pub const Model = struct {
                 .surface = try padding.draw(ctx),
             };
 
-            children[1] = button_child;
+            try children.append(button_child);
         }
 
-        {
+        if (maybe_right) |right| {
             // right child
-            const right = self.focused +% 1;
-            self.vts[right].visible = true;
+            const vt = self.vts.items[right];
+            vt.visible = true;
             const border: vxfw.Border = .{
-                .child = self.vts[right].widget(),
+                .child = vt.widget(),
             };
             var padding: vxfw.Padding = .{
                 .child = border.widget(),
@@ -191,7 +225,7 @@ pub const Model = struct {
                 .surface = try padding.draw(ctx),
             };
 
-            children[2] = button_child;
+            try children.append(button_child);
         }
 
         return .{
@@ -199,12 +233,12 @@ pub const Model = struct {
             .widget = self.widget(),
             .focusable = false,
             .buffer = &.{},
-            .children = children,
+            .children = children.items,
         };
     }
 
     pub fn focusedVt(self: *Model) *Terminal {
-        return &self.vts[self.focused];
+        return self.vts.items[self.focused];
     }
 
     fn rightOffset(self: *Model) i17 {
@@ -213,5 +247,11 @@ pub const Model = struct {
 
     fn leftOffset(self: *Model) i17 {
         return self.offset - self.win_width + 3;
+    }
+
+    pub fn newTerminal(self: *Model) !void {
+        const vt = try self.gpa.create(Terminal);
+        try vt.init(self.gpa, .{});
+        try self.vts.append(vt);
     }
 };

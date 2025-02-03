@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const vaxis = @import("vaxis");
 
 const json = std.json;
 const net = std.net;
@@ -21,6 +22,27 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        const stdout = std.io.getStdOut();
+        var buf_writer = std.io.bufferedWriter(stdout.writer());
+        var writer = buf_writer.writer();
+
+        const ctlseqs = vaxis.ctlseqs;
+
+        // Pop kitty keyboard
+        writer.writeAll(ctlseqs.csi_u_pop) catch {};
+        // Exit alt screen
+        writer.writeAll(ctlseqs.rmcup) catch {};
+        // Show the cursor
+        writer.writeAll(ctlseqs.show_cursor) catch {};
+        // Reset bracketed paste
+        writer.writeAll(ctlseqs.bp_reset) catch {};
+        // Disable color scheme updates
+        writer.writeAll(ctlseqs.color_scheme_reset) catch {};
+
+        buf_writer.flush() catch {};
+
+        // TODO: Reset ioctls
+
         self.stream.close();
     }
 

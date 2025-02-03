@@ -42,8 +42,9 @@ pub fn main() !void {
         // const dev_null = try std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
         // try std.posix.dup2(dev_null, std.posix.STDIN_FILENO);
         // try std.posix.dup2(dev_null, std.posix.STDOUT_FILENO);
-        // // try std.posix.dup2(dev_null, std.posix.STDERR_FILENO);
-        // // we are the child.
+        // try std.posix.dup2(dev_null, std.posix.STDERR_FILENO);
+
+        // Set session ID to orphan this process off so it lives beyond when the terminal closes
         // _ = std.os.linux.setsid();
         var srv: server.Server = undefined;
         try srv.init(gpa.allocator(), sockpath, &loop);
@@ -53,8 +54,6 @@ pub fn main() !void {
         try loop.run(.until_done);
         return;
         // }
-        //
-        // return;
 
         // // We are the original process. Let's sleep and try to connect again
         // const retries: u8 = 50;
@@ -70,8 +69,10 @@ pub fn main() !void {
         //             return err2;
         //         }
         //     }
+        // }
+        // return error.FailedConnection;
     };
-    // return error.FailedConnection;
+    defer cl.deinit();
 
     var args = try std.process.argsWithAllocator(gpa.allocator());
     defer args.deinit();
