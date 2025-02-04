@@ -1,18 +1,17 @@
-const std = @import("std");
-const xev = @import("xev");
-const vaxis = @import("vaxis");
-
 const net = std.net;
 const posix = std.posix;
-const protocol = @import("protocol.zig");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+
+const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const xev = @import("xev");
+
+const protocol = @import("protocol.zig");
 const ScrollingWM = @import("scrolling.zig").Model;
 const TilingWM = @import("tiling/tiling.zig").Model;
 
-const Allocator = std.mem.Allocator;
-
-const assert = std.debug.assert;
-
+const std = @import("std");
 pub const Server = struct {
     gpa: Allocator,
 
@@ -223,15 +222,15 @@ pub const RpcConnection = struct {
     const ReadError = Allocator.Error || protocol.Error;
 
     pub fn deinit(self: *RpcConnection, detach: bool) void {
-        self.connected.store(false, .unordered);
         self.server.removeConnection(self);
+        self.queue.deinit();
         if (self.session) |*session| {
             session.deinit(self.server.gpa, detach);
             self.session = null;
         }
-        self.queue.deinit();
         self.sendCloseMessage() catch {};
         posix.close(self.tcp.fd);
+        self.connected.store(false, .unordered);
     }
 
     pub fn deinitLocked(self: *RpcConnection, detach: bool) void {
@@ -493,7 +492,6 @@ const SessionConnection = struct {
                 std.log.debug("couldn't send DSR {}", .{err});
             };
         }
-        self.tty.deinit();
         self.process_events.deinit();
         if (self.read_thread) |thread| {
             std.log.debug("joining thread", .{});
@@ -501,6 +499,7 @@ const SessionConnection = struct {
             std.log.debug("thread joined", .{});
             self.read_thread = null;
         }
+        self.tty.deinit();
     }
 
     fn processEvents(
@@ -814,8 +813,22 @@ pub const Session = struct {
                 break;
             }
             try tick.widget.handleEvent(&ctx, .tick);
+            try self.handleCommands(&ctx.cmds);
         }
-        try self.handleCommands(&ctx.cmds);
+        if (self.widget.shouldQuit()) {
+            self.server.removeSession(self);
+            for (self.connections.items) |conn| {
+                // Deinit the connection
+                conn.rpc_conn.deinit(false);
+            }
+            self.server.gpa.destroy(self);
+            return;
+        }
+        if (self.wants_focus) |focus| {
+            try self.focus_handler.focusWidget(&ctx, focus);
+            try self.handleCommands(&ctx.cmds);
+            self.wants_focus = null;
+        }
         if (ctx.redraw)
             try self.draw();
     }

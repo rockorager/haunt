@@ -219,9 +219,7 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
     );
     self.io_thr.setName("io") catch {};
 
-    self.renderer_mutex.lock();
-    defer self.renderer_mutex.unlock();
-    self.io.queueMessage(.{ .resize = self.io.size }, .locked);
+    try self.notifyResize(self.io.size);
 }
 
 pub fn deinit(self: *Terminal) void {
@@ -277,10 +275,10 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
     switch (event) {
         .init => try ctx.tick(8, self.widget()),
         .tick => {
-            try self.drainAppMailbox(ctx);
-            try self.drainRendererMailbox();
-            // Set redraw if it was false
-            ctx.redraw = ctx.redraw or (self.visible and self.redraw.load(.unordered));
+            try self.tick(ctx);
+
+            if (self.child_exited) return;
+            // We only register a new tick if we haven't exited
             try ctx.tick(8, self.widget());
         },
         .key_press, .key_release => |key| {
@@ -292,6 +290,15 @@ pub fn handleEvent(self: *Terminal, ctx: *vxfw.EventContext, event: vxfw.Event) 
         .mouse_leave => try ctx.setMouseShape(.default),
         else => {},
     }
+}
+
+/// Tick the terminal event loop
+pub fn tick(self: *Terminal, ctx: *vxfw.EventContext) anyerror!void {
+    try self.drainAppMailbox(ctx);
+    try self.drainRendererMailbox();
+
+    // Set redraw if it was false
+    ctx.redraw = ctx.redraw or (self.visible and self.redraw.load(.unordered));
 }
 
 fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
@@ -1056,7 +1063,7 @@ fn handleSurfaceMessage(
         // Close without confirmation.
         .child_exited => {
             self.child_exited = true;
-            try self.close(ctx);
+            // try self.close(ctx);
         },
         //
         // .desktop_notification => |notification| {
@@ -1387,8 +1394,6 @@ fn getShell(gpa: Allocator) ![]const u8 {
 }
 
 pub fn close(self: *Terminal, maybe_ctx: ?*vxfw.EventContext) anyerror!void {
-    if (self.child_exited) return;
-
     {
         self.renderer_mutex.lock();
         defer self.renderer_mutex.unlock();
