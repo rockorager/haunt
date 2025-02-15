@@ -42,6 +42,8 @@ pub const Options = struct {
         .title = true,
     },
     cursor_blink: bool = false,
+    // Optional environment variables to add to the child process environment
+    env: ?*const std.process.EnvMap = null,
 };
 
 const Config = struct {};
@@ -79,6 +81,7 @@ wakeup_c: xev.Completion = .{},
 redraw: std.atomic.Value(bool),
 quit: std.atomic.Value(bool),
 resize_msg_sent: std.atomic.Value(bool),
+pending_renderer_resize: std.atomic.Value(bool),
 
 cursor_state: ?vxfw.CursorState = null,
 mouse_shape: vaxis.Mouse.Shape = .default,
@@ -117,6 +120,7 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
         .redraw = std.atomic.Value(bool).init(false),
         .quit = std.atomic.Value(bool).init(false),
         .resize_msg_sent = std.atomic.Value(bool).init(false),
+        .pending_renderer_resize = std.atomic.Value(bool).init(false),
         .visible = true,
         .title = "",
         .password_input = false,
@@ -174,13 +178,16 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
         .term = opts.term,
 
         // TODO:cgroup management
-        // .linux_cgroup = if (comptime builtin.os.tag == .linux and
-        //     @hasDecl(apprt.runtime.Surface, "cgroup"))
-        //     rt_surface.cgroup()
-        // else
-        //     Command.linux_cgroup_default,
     });
     errdefer io_exec.deinit();
+
+    if (opts.env) |env| {
+        io_exec.subprocess.env.hash_map.allocator = io_exec.subprocess.arena.allocator();
+        var iter = env.iterator();
+        while (iter.next()) |entry| {
+            try io_exec.subprocess.env.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
 
     var io_mailbox = try termio.Mailbox.initSPSC(gpa);
     errdefer io_mailbox.deinit(gpa);
@@ -210,6 +217,8 @@ pub fn init(self: *Terminal, gpa: Allocator, opts: Options) !void {
 
     try termio.Termio.init(&self.io, gpa, termio_opts);
     errdefer self.io.deinit();
+
+    self.io.backend.initTerminal(&self.io.terminal);
 
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
@@ -664,6 +673,11 @@ fn updateScreen(self: *Terminal) !void {
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
 
+    if (self.pending_renderer_resize.load(.unordered)) {
+        self.pending_renderer_resize.store(false, .unordered);
+        self.redraw.store(true, .unordered);
+    }
+
     var row_iter = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row: u16 = 0;
     while (row_iter.next()) |pin| {
@@ -1106,9 +1120,12 @@ fn resize(self: *Terminal, size: renderer.Size) !void {
     // Lock the screen
     self.screen_mutex.lock();
     defer self.screen_mutex.unlock();
-    self.screen.deinit(self.gpa);
     const grid = size.grid();
-    self.screen = try vaxis.AllocatingScreen.init(self.gpa, grid.columns, grid.rows);
+    if (grid.columns != self.screen.width or grid.rows != self.screen.height) {
+        self.screen.deinit(self.gpa);
+        self.screen = try vaxis.AllocatingScreen.init(self.gpa, grid.columns, grid.rows);
+    }
+    self.pending_renderer_resize.store(true, .unordered);
     self.redraw.store(true, .unordered);
     try self.wakeup.notify();
 }

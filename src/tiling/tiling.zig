@@ -43,13 +43,15 @@ pub const Node = union(enum) {
         }
     }
 
-    pub fn prune(self: *Node, gpa: Allocator, model: *Model) void {
+    pub fn prune(self: *Node, gpa: Allocator, model: *Model, ctx: *vxfw.EventContext) void {
         switch (self.*) {
             .vt => {},
             .split_v => |split| {
+                split.lhs.prune(gpa, model, ctx);
                 if (split.lhs.childExited()) {
                     if (split.lhs.vt == model.focused) {
                         model.focused = split.rhs.nextFocus();
+                        ctx.redraw = true;
                     }
                     split.lhs.vt.deinit();
                     gpa.destroy(split.lhs.vt);
@@ -57,9 +59,11 @@ pub const Node = union(enum) {
                     gpa.destroy(split);
                     return;
                 }
+                split.rhs.prune(gpa, model, ctx);
                 if (split.rhs.childExited()) {
                     if (split.rhs.vt == model.focused) {
                         model.focused = split.lhs.nextFocus();
+                        ctx.redraw = true;
                     }
                     split.rhs.vt.deinit();
                     gpa.destroy(split.rhs.vt);
@@ -77,11 +81,6 @@ pub const Node = union(enum) {
             else => return false,
         }
     }
-};
-
-const SplitHorizontal = struct {
-    top: Node,
-    bot: Node,
 };
 
 pub const Model = struct {
@@ -186,7 +185,6 @@ pub const Model = struct {
             },
             else => {},
         }
-        // self.root.prune(self.gpa, self.focused, ctx);
         // return self.root.handleEvent(ctx, event);
     }
 
@@ -206,7 +204,7 @@ pub const Model = struct {
                 // tick each terminal event loop
                 try self.root.tick(ctx);
                 // Prune the tree
-                self.root.prune(self.gpa, self);
+                self.root.prune(self.gpa, self, ctx);
                 // Update focus
                 try ctx.requestFocus(self.focusedVt().widget());
                 // Add another tick
@@ -223,7 +221,6 @@ pub const Model = struct {
     }
 
     pub fn draw(self: *Model, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        self.root.prune(self.gpa, self);
         const max_size = ctx.max.size();
 
         var children = std.ArrayList(vxfw.SubSurface).init(ctx.arena);
